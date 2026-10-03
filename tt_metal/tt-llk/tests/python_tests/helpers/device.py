@@ -25,6 +25,7 @@ from ttexalens.tt_exalens_lib import (
 
 from .device_io import read_from_device, write_words_to_device
 from .logger import logger
+from .target_config import TestTargetConfig
 
 
 class _UninitializedMailboxes:
@@ -254,6 +255,23 @@ def soft_reset_bits(location: str = "0,0") -> int:
     return get_register_store(location, 0).read_register("RISCV_DEBUG_REG_SOFT_RESET_0")
 
 
+# Quasar kernels mirror their completion flags into cluster control scratch registers (host_signal in boot.h), so
+# waiting on a kernel never reads its L1. ttsim keeps the L1 path.
+_QUASAR_HOST_SIGNAL_BASE = 0x030000B0  # TT_CLUSTER_CTRL_SCRATCH_28
+
+
+def host_signal_address(slot: int) -> int | None:
+    """Address of host signal slot, or None when this target signals through L1 only."""
+    if get_chip_architecture() != ChipArchitecture.QUASAR:
+        return None
+    # The emulator models the cluster control registers; ttsim (a shared library) does not
+    target = TestTargetConfig._instance
+    sim = os.environ.get("TT_METAL_SIMULATOR") or os.environ.get("TT_UMD_SIMULATOR_PATH") or ""
+    if target is not None and target.run_simulator and sim.endswith(".so"):
+        return None
+    return _QUASAR_HOST_SIGNAL_BASE + slot * 4
+
+
 def assert_if_all_in_reset(location: str = "0,0", place: str = ""):
     soft_reset = get_register_store(location, 0).read_register(
         "RISCV_DEBUG_REG_SOFT_RESET_0"
@@ -365,6 +383,12 @@ def reset_mailboxes(location: str = "0,0"):
             addr=MAILBOX_START_BLOCK,
             data=[0xA3] * len(Mailboxes),  # All 4 TRISC mailboxes on Quasar
         )
+        for slot in range(4):
+            addr = host_signal_address(slot)
+            if addr is not None:
+                write_words_to_device(
+                    location=location, addr=addr, data=[0xA3], safe_mode=False
+                )
     else:
         write_words_to_device(
             location=location,
