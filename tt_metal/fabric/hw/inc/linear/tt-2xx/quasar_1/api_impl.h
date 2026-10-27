@@ -763,6 +763,6 @@ FORCE_INLINE void fabric_unicast_noc_unicast_write(
 //     tt::tt_fabric::NocSparseMulticastWriteCommandHeader sparse_mcast_command_header,
 //     uint16_t hops) {}
 
-#endif  // multicast not yet implemented for Horizon
+// #endif  // multicast not yet implemented for Horizon
 
 }  // namespace tt::tt_fabric::linear::experimental

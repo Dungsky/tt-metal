@@ -61,6 +61,10 @@ std::unique_ptr<tt::tt_metal::Program> create_and_compile_fabric_program(
 
 void configure_fabric_cores(tt::tt_metal::MetalEnvImpl& env_impl, tt::tt_metal::IDevice* device) {
     auto soc_desc = env_impl.get_cluster().get_soc_desc(device->id());
+    if (soc_desc.arch == tt::ARCH::QUASAR &&
+        soc_desc.get_arch_descriptor().get_ip_variant() == tt::IpVariant::HORIZON) {
+        return;  // Horizon uses crossbar; no ERISC cores to configure.
+    }
     const auto& control_plane = env_impl.get_control_plane();
     const auto fabric_node_id = control_plane.get_fabric_node_id_from_physical_chip_id(device->id());
     const auto router_chans_and_direction = control_plane.get_active_fabric_eth_channels(fabric_node_id);

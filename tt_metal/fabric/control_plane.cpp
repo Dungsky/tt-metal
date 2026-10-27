@@ -469,7 +469,7 @@ void ControlPlane::init_control_plane(
     std::optional<std::reference_wrapper<const std::map<FabricNodeId, ChipId>>>
         logical_mesh_chip_id_to_physical_chip_id_mapping) {
     const auto& cluster = this->cluster_.get();
-    const auto& driver = cluster.get_driver();
+    const auto& driver = this->cluster_.get().get_driver();
     const auto& distributed_context = tt_metal::distributed::multihost::DistributedContext::get_current_world();
     const auto& rtoptions = this->rtoptions_.get();
     auto fabric_config = this->get_fabric_config();
@@ -612,7 +612,7 @@ void ControlPlane::init_control_plane(
 
 void ControlPlane::init_control_plane_auto_discovery() {
     const auto& cluster = this->cluster_.get();
-    const auto& driver = cluster.get_driver();
+    const auto& driver = this->cluster_.get().get_driver();
     const auto& distributed_context = tt_metal::distributed::multihost::DistributedContext::get_current_world();
     const auto& rtoptions = this->rtoptions_.get();
 
@@ -2777,14 +2777,15 @@ void ControlPlane::write_routing_info_to_devices(
     // TODO: offset=0 returns the L1-window base (first 1 MB per core); revisit if writes
     //       beyond 1 MB into a core's L1 are needed.
     {
-        const auto ip_variant = cluster.get_soc_desc(physical_chip_id).get_arch_descriptor().get_ip_variant();
+        const auto ip_variant =
+            this->cluster_.get().get_soc_desc(physical_chip_id).get_arch_descriptor().get_ip_variant();
         if (ip_variant == tt::IpVariant::HORIZON) {
             tt::tt_fabric::horizon_routing_l1_info_t horizon_info = {};
             horizon_info.my_mesh_id = *mesh_id;
             horizon_info.my_device_id = chip_id;
             {
                 const auto my_cores =
-                    cluster.get_soc_desc(physical_chip_id).get_cores(CoreType::TENSIX, CoordSystem::NOC0);
+                    this->cluster_.get().get_soc_desc(physical_chip_id).get_cores(CoreType::TENSIX, CoordSystem::NOC0);
                 if (!my_cores.empty()) {
                     horizon_info.my_noc_x = my_cores[0].x;
                     horizon_info.my_noc_y = my_cores[0].y;
@@ -2804,13 +2805,14 @@ void ControlPlane::write_routing_info_to_devices(
                     continue;
                 }
 
-                auto* dst_device = cluster.get_driver()->get_tt_device(dst_phys_id);
+                auto* dst_device = this->cluster_.get().get_driver()->get_tt_device(dst_phys_id);
                 const auto access_points = dst_device->get_access_points();
                 if (access_points.empty()) {
                     continue;
                 }
 
-                for (const auto& core : cluster.get_soc_desc(dst_phys_id).get_all_cores(CoordSystem::NOC0)) {
+                for (const auto& core :
+                     this->cluster_.get().get_soc_desc(dst_phys_id).get_cores(CoreType::TENSIX, CoordSystem::NOC0)) {
                     if (core.x >= tt::tt_fabric::MAX_HORIZON_NOC_X || core.y >= tt::tt_fabric::MAX_HORIZON_NOC_Y) {
                         continue;
                     }
@@ -3485,7 +3487,7 @@ void ControlPlane::write_udm_fabric_connections_to_tensix_cores(
     std::unordered_set<tt::tt_metal::CoreCoord> dispatch_mux_cores_translated =
         tensix_config.get_translated_dispatch_mux_cores();
 
-    const auto& soc_desc = cluster.get_soc_desc(physical_chip_id);
+    const auto& soc_desc = this->cluster_.get().get_soc_desc(physical_chip_id);
     const std::vector<tt::umd::CoreCoord>& all_tensix_cores =
         soc_desc.get_cores(CoreType::TENSIX, CoordSystem::TRANSLATED);
 
