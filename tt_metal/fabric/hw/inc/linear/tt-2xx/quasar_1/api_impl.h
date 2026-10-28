@@ -65,6 +65,7 @@ FORCE_INLINE void fabric_unicast_noc_unicast_write(
     noc_async_write(src_addr, remote_addr, size);
 }
 
+#ifdef FABRIC_2D
 // Route-manager variant: dst_dev_id / dst_mesh_id come from connection_manager slots.
 FORCE_INLINE void fabric_unicast_noc_unicast_write(
     tt::tt_fabric::RoutingPlaneConnectionManager& connection_manager,
@@ -78,6 +79,7 @@ FORCE_INLINE void fabric_unicast_noc_unicast_write(
             &slot.sender, packet_header, slot.dst_dev_id, slot.dst_mesh_id, src_addr, size, noc_unicast_command_header);
     });
 }
+#endif  // FABRIC_2D
 
 // Overload 2: num_hops-based (linear API compatibility). Delegates to overload 1.
 // TODO: num_hops is currently forwarded as dst_dev_id with dst_mesh_id=0; replace
