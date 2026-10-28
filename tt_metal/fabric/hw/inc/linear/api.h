@@ -7,5 +7,5 @@
 #if defined(ARCH_WORMHOLE) || defined(ARCH_BLACKHOLE)
 #include "tt_metal/fabric/hw/inc/linear/tt-1xx/api_impl.h"
 #else
-#include "tt_metal/fabric/hw/inc/linear/tt-2xx/quasar_1/api_impl.h"
+#include "tt_metal/fabric/hw/inc/linear/tt-2xx/quasar_horizon/api_impl.h"
 #endif

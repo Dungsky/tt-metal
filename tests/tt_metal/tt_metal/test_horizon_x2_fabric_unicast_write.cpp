@@ -16,7 +16,7 @@
 //
 // The test verifies that:
 //   (a) SetFabricConfig correctly populates the flat-address routing table on both chips.
-//   (b) fabric_unicast_noc_unicast_write (linear/experimental API) reaches the correct remote L1.
+//   (b) fabric_unicast_noc_unicast_write (mesh/experimental API) reaches the correct remote L1.
 //   (c) Multi-word payloads are transferred correctly.
 
 #include "common/device_fixture.hpp"
@@ -65,10 +65,10 @@ bool horizon_x2_available() {
            MetalContext::instance().get_cluster().number_of_devices() >= 2;
 }
 
-// One-word (4-byte) L1 buffer, sharded to core (0,0).
-std::shared_ptr<distributed::MeshBuffer> make_word_buffer(distributed::MeshDevice& dev) {
+// One-word (4-byte) L1 buffer, sharded to the given core (default (0,0)).
+std::shared_ptr<distributed::MeshBuffer> make_word_buffer(distributed::MeshDevice& dev, CoreCoord core = {0, 0}) {
     const ShardSpecBuffer shard_spec(
-        CoreRangeSet(CoreRange({0, 0}, {0, 0})), {1, 1}, ShardOrientation::ROW_MAJOR, {1, 1}, {1, 1});
+        CoreRangeSet(CoreRange(core, core)), {1, 1}, ShardOrientation::ROW_MAJOR, {1, 1}, {1, 1});
     const distributed::DeviceLocalBufferConfig local_cfg{
         .page_size = sizeof(uint32_t),
         .buffer_type = BufferType::L1,
@@ -78,10 +78,11 @@ std::shared_ptr<distributed::MeshBuffer> make_word_buffer(distributed::MeshDevic
         distributed::ReplicatedBufferConfig{.size = sizeof(uint32_t)}, local_cfg, &dev);
 }
 
-// N-word L1 buffer, sharded to core (0,0).  Each word is a separate page.
-std::shared_ptr<distributed::MeshBuffer> make_n_word_buffer(distributed::MeshDevice& dev, uint32_t n) {
+// N-word L1 buffer, sharded to the given core (default (0,0)).  Each word is a separate page.
+std::shared_ptr<distributed::MeshBuffer> make_n_word_buffer(
+    distributed::MeshDevice& dev, uint32_t n, CoreCoord core = {0, 0}) {
     const ShardSpecBuffer shard_spec(
-        CoreRangeSet(CoreRange({0, 0}, {0, 0})), {n, 1}, ShardOrientation::ROW_MAJOR, {1, 1}, {n, 1});
+        CoreRangeSet(CoreRange(core, core)), {n, 1}, ShardOrientation::ROW_MAJOR, {1, 1}, {n, 1});
     const distributed::DeviceLocalBufferConfig local_cfg{
         .page_size = sizeof(uint32_t),
         .buffer_type = BufferType::L1,
@@ -96,7 +97,9 @@ void run_fabric_unicast_write_test(
     distributed::MeshDevice* chip1,
     tt::Cluster& cluster,
     uint32_t num_words,
-    uint32_t base_value) {
+    uint32_t base_value,
+    ChipId chip1_id = 1,
+    CoreCoord checker_core = {0, 0}) {
     // ------------------------------------------------------------------
     // Allocate L1 buffers.
     //   src_buf   — chip 0, holds the outgoing payload
@@ -104,8 +107,8 @@ void run_fabric_unicast_write_test(
     //   result_buf — chip 1, one word: 1 = pass, 0xDEAD0000|i = fail at word i
     // ------------------------------------------------------------------
     auto src_buf = make_n_word_buffer(*chip0, num_words);
-    auto recv_buf = make_n_word_buffer(*chip1, num_words);
-    auto result_buf = make_word_buffer(*chip1);
+    auto recv_buf = make_n_word_buffer(*chip1, num_words, checker_core);
+    auto result_buf = make_word_buffer(*chip1, checker_core);
 
     // Zero-initialise receive and result buffers so kernels can spin-detect.
     distributed::EnqueueWriteMeshBuffer(
@@ -115,7 +118,8 @@ void run_fabric_unicast_write_test(
     // ------------------------------------------------------------------
     // Resolve NOC0 coordinates for core (0,0) on chip 1.
     // ------------------------------------------------------------------
-    const CoreCoord chip1_noc0 = cluster.get_virtual_coordinate_from_logical_coordinates(1, {0, 0}, CoreType::WORKER);
+    const CoreCoord chip1_noc0 =
+        cluster.get_virtual_coordinate_from_logical_coordinates(chip1_id, checker_core, CoreType::WORKER);
 
     std::cout << "[UNICAST_WRITE] chip1 core(0,0) NOC0=(" << chip1_noc0.x << "," << chip1_noc0.y << ")" << std::endl;
 
@@ -135,14 +139,15 @@ void run_fabric_unicast_write_test(
             .runtime_arg_schema = {.runtime_arg_names = {"recv_l1_addr", "num_words", "base_value", "result_l1_addr"}},
             .hw_config = experimental::DataMovementHardwareConfig{},
         }},
-        .work_units = {experimental::WorkUnitSpec{.name = "main", .kernels = {CHECKER_K}, .target_nodes = node}},
+        .work_units = {experimental::WorkUnitSpec{
+            .name = "main", .kernels = {CHECKER_K}, .target_nodes = checker_core}},
     };
     Program checker_prog = experimental::MakeProgramFromSpec(*chip1, checker_spec);
     experimental::ProgramRunArgs checker_args;
     checker_args.kernel_run_args = {experimental::ProgramRunArgs::KernelRunArgs{
         .kernel = CHECKER_K,
         .runtime_arg_values = experimental::MakeRuntimeArgsForSingleNode(
-            node,
+            checker_core,
             {
                 {"recv_l1_addr", recv_buf->address()},
                 {"num_words", num_words},
@@ -154,9 +159,6 @@ void run_fabric_unicast_write_test(
 
     distributed::MeshWorkload checker_wl;
     checker_wl.add_program(distributed::MeshCoordinateRange(chip1->shape()), std::move(checker_prog));
-
-    std::cout << "[UNICAST_WRITE] dispatching checker kernel on chip 1 (non-blocking)..." << std::endl;
-    distributed::EnqueueMeshWorkload(chip1->mesh_command_queue(), checker_wl, false);
 
     // ------------------------------------------------------------------
     // Sender kernel (chip 0) — dispatch non-blocking.
@@ -188,7 +190,7 @@ void run_fabric_unicast_write_test(
                 {"dst_l1_addr", recv_buf->address()},
                 {"dst_noc_x", static_cast<uint32_t>(chip1_noc0.x)},
                 {"dst_noc_y", static_cast<uint32_t>(chip1_noc0.y)},
-                {"dst_dev_id", 1u},
+                {"dst_dev_id", static_cast<uint32_t>(chip1_id)},
                 {"base_value", base_value},
             }),
     }};
@@ -197,8 +199,16 @@ void run_fabric_unicast_write_test(
     distributed::MeshWorkload sender_wl;
     sender_wl.add_program(distributed::MeshCoordinateRange(chip0->shape()), std::move(sender_prog));
 
-    std::cout << "[UNICAST_WRITE] dispatching sender kernel on chip 0 (non-blocking)..." << std::endl;
-    distributed::EnqueueMeshWorkload(chip0->mesh_command_queue(), sender_wl, false);
+    // Single queue (chip0==chip1): dispatch sender first so data exists when checker runs.
+    if (chip0 == chip1) {
+        std::cout << "[UNICAST_WRITE] single-device: dispatching sender first, then checker..." << std::endl;
+        distributed::EnqueueMeshWorkload(chip0->mesh_command_queue(), sender_wl, false);
+        distributed::EnqueueMeshWorkload(chip1->mesh_command_queue(), checker_wl, false);
+    } else {
+        std::cout << "[UNICAST_WRITE] dispatching checker on chip 1, sender on chip 0..." << std::endl;
+        distributed::EnqueueMeshWorkload(chip1->mesh_command_queue(), checker_wl, false);
+        distributed::EnqueueMeshWorkload(chip0->mesh_command_queue(), sender_wl, false);
+    }
 
     // ------------------------------------------------------------------
     // Wait: sender first (ensures noc_async_write_barrier ran), then checker.
@@ -221,6 +231,17 @@ void run_fabric_unicast_write_test(
               << (result[0] == 1u ? "PASSED" : "FAILED") << std::endl;
 }
 
+bool horizon_ttsim_available() {
+    return std::getenv("TT_METAL_SIMULATOR") != nullptr &&
+           MetalContext::instance().get_cluster().number_of_devices() >= 1;
+}
+
+// Opens MMIO device 0 only. No SetFabricConfig — routing table bypassed by TT_METAL_TTSIM.
+class HorizonTtsimFabricFixture : public QuasarMeshDeviceSingleCardFixture {
+protected:
+    void create_devices() override { AnyDispatchMeshDeviceSingleCardFixture::create_devices({0}); }
+};
+
 }  // namespace
 
 TEST_F(HorizonX2FabricFixture, FabricUnicastWrite_SingleWord) {
@@ -237,4 +258,35 @@ TEST_F(HorizonX2FabricFixture, FabricUnicastWrite_MultiWord) {
     }
     auto& cluster = MetalContext::instance().get_cluster();
     run_fabric_unicast_write_test(devices_[0].get(), devices_[1].get(), cluster, 16, 0xABCD0000);
+}
+
+TEST_F(HorizonTtsimFabricFixture, TtsimUnicastWrite_SingleWord) {
+    if (!horizon_ttsim_available()) {
+        GTEST_SKIP() << "set TT_METAL_SIMULATOR=libttsim_qsr.so to enable";
+    }
+    auto& cluster = MetalContext::instance().get_cluster();
+    // chip0 == chip1: both point to device 0. Checker on core (1,0), sender on (0,0).
+    run_fabric_unicast_write_test(
+        devices_[0].get(),
+        devices_[0].get(),
+        cluster,
+        1,
+        0xC0FFEE00,
+        /*chip1_id=*/0,
+        /*checker_core=*/{1, 0});
+}
+
+TEST_F(HorizonTtsimFabricFixture, TtsimUnicastWrite_MultiWord) {
+    if (!horizon_ttsim_available()) {
+        GTEST_SKIP() << "set TT_METAL_SIMULATOR=libttsim_qsr.so to enable";
+    }
+    auto& cluster = MetalContext::instance().get_cluster();
+    run_fabric_unicast_write_test(
+        devices_[0].get(),
+        devices_[0].get(),
+        cluster,
+        16,
+        0xABCD0000,
+        /*chip1_id=*/0,
+        /*checker_core=*/{1, 0});
 }
