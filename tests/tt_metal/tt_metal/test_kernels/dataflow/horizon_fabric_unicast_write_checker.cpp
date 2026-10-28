@@ -20,9 +20,12 @@ void kernel_main() {
 
     volatile uint32_t* recv = reinterpret_cast<volatile uint32_t*>(recv_l1_addr);
     volatile uint32_t* result = reinterpret_cast<volatile uint32_t*>(result_l1_addr);
+    // NOC writes from another chip don't invalidate the DM core's L1 cache.
+    // Read recv[0] through the uncached window so the spin sees the write immediately.
+    volatile uint32_t* recv_uncached = reinterpret_cast<volatile uint32_t*>(MEM_L1_UNCACHED_BASE + recv_l1_addr);
 
     // Spin until the sender's first word arrives (non-zero sentinel).
-    while (recv[0] == 0) { /* spin */
+    while (recv_uncached[0] == 0) { /* spin */
     }
 
     // Verify all words.

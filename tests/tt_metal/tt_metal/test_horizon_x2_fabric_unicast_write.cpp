@@ -21,6 +21,7 @@
 
 #include "common/device_fixture.hpp"
 #include "context/metal_context.hpp"
+#include <umd/device/tt_device/tt_device.hpp>
 
 #include <tt-metalium/distributed.hpp>
 #include <tt-metalium/experimental/metal2_host_api/program.hpp>
@@ -45,6 +46,88 @@ namespace {
 // Opens chips 0 and 1 with Fabric 1D initialised.
 // Fabric config must be set before device creation so that control_plane
 // populates horizon_routing_l1_info_t during device open.
+
+// Write correct cross-chip routing tables for horizon_x2 (UD topology).
+//
+// The standard SetFabricConfig(FABRIC_1D) path builds routing tables by iterating
+// the fabric mesh; without Ethernet links, auto-discovery makes a separate 1×1 mesh
+// per chip so cross-chip entries are never written.
+//
+// Access point selection for horizon_x2:
+//   chip0 → chip1: access_points[0] (chip0 routes 0x20/0x21 externally, both reach chip1)
+//   chip1 → chip0: access_points[1] (chip1 routes only 0x11; access_points[0] has a 0x10
+//                  prefix = chip1's own REMOTE window → writes loop back to chip1 itself)
+//
+// TODO: generalise via ATT route-window query once UMD exposes that information.
+static void write_horizon_x2_routing_tables(tt::Cluster& cluster, const tt::tt_metal::Hal& hal) {
+    using tt::umd::CoordSystem;
+    using tt::umd::CoreType;
+
+    const uint64_t routing_table_addr =
+        hal.get_dev_addr(tt::tt_metal::HalProgrammableCoreType::TENSIX, tt::tt_metal::HalL1MemAddrType::ROUTING_TABLE);
+
+    constexpr uint32_t kNumChips = 2;
+    for (uint32_t src_phys = 0; src_phys < kNumChips; ++src_phys) {
+        tt::tt_fabric::horizon_routing_l1_info_t info = {};
+        info.my_mesh_id = 0;
+        info.my_device_id = src_phys;
+
+        const auto& src_soc = cluster.get_soc_desc(src_phys);
+        {
+            const auto noc0 = src_soc.get_cores(CoreType::TENSIX, CoordSystem::NOC0);
+            if (!noc0.empty()) {
+                info.my_noc_x = noc0[0].x;
+                info.my_noc_y = noc0[0].y;
+            }
+        }
+
+        for (uint32_t dst_phys = 0; dst_phys < kNumChips; ++dst_phys) {
+            if (dst_phys == src_phys) {
+                continue;  // self-writes use normal NOC, not the crossbar routing table
+            }
+
+            // chip1 → chip0 must use access_points[1]: ap[0] has a 0x10 prefix which is
+            // chip1's own REMOTE window, so writing to ap[0] from chip1 loops back to chip1.
+            const size_t ap_idx = (src_phys == 1u && dst_phys == 0u) ? 1u : 0u;
+
+            auto* dst_dev = cluster.get_driver()->get_tt_device(dst_phys);
+            if (!dst_dev) {
+                continue;
+            }
+
+            const auto aps = dst_dev->get_access_points();
+            if (aps.empty()) {
+                continue;
+            }
+            const size_t safe_ap = std::min(ap_idx, aps.size() - 1);
+
+            const auto& dst_soc = cluster.get_soc_desc(dst_phys);
+            for (const auto& core : dst_soc.get_cores(CoreType::TENSIX, CoordSystem::NOC0)) {
+                if (core.x >= tt::tt_fabric::MAX_HORIZON_NOC_X || core.y >= tt::tt_fabric::MAX_HORIZON_NOC_Y) {
+                    continue;
+                }
+                auto flat = dst_dev->get_flat_address(
+                    aps[safe_ap], core, tt::umd::WindowFlags::UnicastWrite, tt::umd::IoOrdering::Posted, /*offset=*/0);
+                if (flat.has_value()) {
+                    info.flat_addr[0][dst_phys][core.x][core.y] = *flat;
+                }
+            }
+        }
+
+        for (const auto& core : src_soc.get_cores(CoreType::TENSIX, CoordSystem::TRANSLATED)) {
+            cluster.write_core(
+                &info,
+                sizeof(info),
+                tt_cxy_pair(src_phys, tt::tt_metal::CoreCoord{core.x, core.y}),
+                routing_table_addr);
+        }
+        cluster.l1_barrier(src_phys);
+
+        std::cout << "[ROUTING] chip" << src_phys << " table written (dst ap_idx=" << (src_phys == 1u ? 1u : 0u) << ")"
+                  << std::endl;
+    }
+}
+
 class HorizonX2FabricFixture : public QuasarMeshDeviceSingleCardFixture {
 protected:
     void create_devices() override { AnyDispatchMeshDeviceSingleCardFixture::create_devices({0, 1}); }
@@ -52,6 +135,10 @@ protected:
     void SetUp() override {
         tt::tt_fabric::SetFabricConfig(tt::tt_fabric::FabricConfig::FABRIC_1D);
         QuasarMeshDeviceSingleCardFixture::SetUp();
+        // Overwrite routing tables with correct cross-chip entries for horizon_x2.
+        // SetFabricConfig only covers chips in the same mesh; with no Ethernet links
+        // each chip ends up in its own 1×1 mesh and cross-chip entries are missing.
+        write_horizon_x2_routing_tables(MetalContext::instance().get_cluster(), MetalContext::instance().hal());
     }
 
     void TearDown() override {
