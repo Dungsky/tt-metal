@@ -871,7 +871,7 @@ TEST_F(RMSNormOpTest, GatedPreallocatedOutputsOnCachedProgram) {
 
         const auto fw = ttnn::prim::ttml_rmsnorm_fw(x, gamma, gate, /* return_intermediates */ true, kEps, rms, out);
         const auto bw = ttnn::prim::ttml_rmsnorm_bw(
-            x, gamma, rms, dy, gate, compute_dgamma, /* compute_da */ true, da, dgamma_components, dgate);
+            x, gamma, rms, dy, gate, {.dgamma = compute_dgamma}, da, dgamma_components, dgate);
         EXPECT_EQ(device->num_program_cache_entries(), num_programs) << suffix;
 
         EXPECT_EQ(fw[0].buffer()->address(), out.buffer()->address());
@@ -950,8 +950,7 @@ TEST_F(RMSNormOpTest, GatedRejectsMismatchedBackwardTensors) {
                 rms,
                 x,
                 /* gate */ std::nullopt,
-                /* compute_dgamma */ true,
-                /* compute_da */ true,
+                /* outputs */ {},
                 std::nullopt,
                 std::nullopt,
                 ttml::core::zeros(ttnn::Shape(s.head_merged()), device));
@@ -966,13 +965,12 @@ TEST_F(RMSNormOpTest, GatedRejectsMismatchedBackwardTensors) {
                 rms,
                 dy,
                 gate,
-                /* compute_dgamma */ false,
-                /* compute_da */ true,
+                {.dgamma = false},
                 std::nullopt,
                 ttml::core::zeros(ttnn::Shape(s.head_major()), device),
                 std::nullopt);
         }),
-        ThrowsMessage<std::runtime_error>(HasSubstr("compute_dgamma is false")));
+        ThrowsMessage<std::runtime_error>(HasSubstr("outputs.dgamma is false")));
 }
 
 // A frozen input in gated mode: the kernel skips dL/dinput, and with a frozen gamma also du, leaving only dL/dgate.
@@ -1191,9 +1189,8 @@ TEST_F(RMSNormOpTest, BackwardRejectsNoRequestedGrad) {
                 in.rms,
                 in.dL_dout,
                 /* gate */ std::nullopt,
-                /* compute_dgamma */ true,
-                /* compute_da */ false,
+                {.da = false},
                 ttml::core::zeros_like(in.input));
         }),
-        ThrowsMessage<std::runtime_error>(HasSubstr("compute_da is false")));
+        ThrowsMessage<std::runtime_error>(HasSubstr("outputs.da is false")));
 }
