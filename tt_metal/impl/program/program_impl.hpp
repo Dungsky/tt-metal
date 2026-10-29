@@ -19,6 +19,7 @@
 #include "hostdev/remote_dfb_constants.h"  // REMOTE_DFB_OFFSET_NONE
 #include "program_device_map.hpp"          // ProgramTransferInfo
 #include "program_allocation_support.hpp"
+#include "program_builder.hpp"
 #include "impl/buffers/semaphore.hpp"
 #include "tt-metalium/sub_device_types.hpp"
 #include "tt-metalium/tensor/spec/tensor_spec.hpp"                               // Metal 2.0 TensorParameter registry
@@ -219,8 +220,6 @@ struct BoundTensorFootprint {
 
 BoundTensorFootprint make_bound_tensor_footprint(const MeshTensor& tensor);
 
-class Metal1ProgramBuilder;
-
 // The internal implementation of the Program class. Program is a view of this class that's usable by API clients.
 class ProgramImpl : public std::enable_shared_from_this<ProgramImpl> {
 public:
@@ -364,6 +363,12 @@ public:
         ttsl::Span<ProgramImpl*> programs);
 
     std::vector<uint32_t>& get_program_config_sizes() noexcept { return program_config_sizes_; }
+
+    CBHandle add_circular_buffer(const CoreRangeSet& core_range_set, const CircularBufferConfig& config);
+    CBHandle add_circular_buffer(
+        const CoreRangeSet& core_range_set,
+        const CircularBufferConfig& config,
+        const experimental::GlobalCircularBuffer& global_circular_buffer);
 
     uint32_t add_dataflow_buffer(
         const CoreRangeSet& core_range_set, const experimental::dfb::DataflowBufferConfig& config);
@@ -576,6 +581,18 @@ public:
     static std::map<CoreCoord, std::vector<std::pair<uint64_t, uint64_t>>> expand_cb_l1_regions_per_core(
         const std::map<CoreRange, std::vector<std::pair<uint64_t, uint64_t>>>& regions_per_range);
 
+    KernelHandle add_kernel(const std::shared_ptr<Kernel>& kernel, const HalProgrammableCoreType& core_type);
+
+    // Allocate the next free semaphore ID on the given cores and insert the semaphore.
+    // Returns the allocated ID; TT_FATALs if no slot can be found.
+    uint32_t create_semaphore(const CoreRangeSet& crs, uint32_t initial_value, CoreType core_type);
+
+    // Insert a semaphore at the caller-specified ID. Used by:
+    //   - Construction paths where the ID is already decided upstream (ProgramDescriptor ctor path).
+    //   - create_semaphore above
+    // The ProgramDescriptor path is something of a hack; it will eventually be deprecated in favor of Metal 2.0.
+    void add_semaphore(const CoreRangeSet& crs, uint32_t semaphore_id, uint32_t init_value, CoreType core_type);
+
     bool runs_on_noc_multicast_only_cores();
 
     std::unordered_map<uint64_t, ProgramCommandSequence>& get_cached_program_command_sequences() noexcept;
@@ -683,19 +700,13 @@ private:
     ContextId context_id_{DEFAULT_CONTEXT_ID};
     uint32_t programmable_core_count_;
     uint32_t max_dfbs_;  // Architecture-specific max DFBs
+    // Metal 1.0 construction state: kernels, circular buffers and semaphores
+    Metal1ProgramBuilder builder_;
     uint64_t id;        // Need to make non-const due to move constructor
     uint64_t runtime_id{0};
     static std::atomic<uint64_t> program_counter;
-    // Programmable core type index -> KernelHandle -> Kernel
-    std::vector<std::unordered_map<KernelHandle, std::shared_ptr<Kernel>>> kernels_;
     std::vector<CoreCoord> grid_extent_;
 
-    std::vector<std::shared_ptr<CircularBufferImpl>> circular_buffers_;
-    std::unordered_map<CBHandle, std::shared_ptr<CircularBufferImpl>> circular_buffer_by_id_;
-    // Tracks which circular buffer indices are being used
-    std::unordered_map<CoreCoord, std::bitset<NUM_CIRCULAR_BUFFERS>> per_core_cb_indices_;
-    std::unordered_map<CoreCoord, std::bitset<NUM_CIRCULAR_BUFFERS>> per_core_local_cb_indices_;
-    std::unordered_map<CoreCoord, std::bitset<NUM_CIRCULAR_BUFFERS>> per_core_remote_cb_indices_;
     std::unordered_map<ChipId, ProgramBinaryStatus> binaries_on_device_;
     EphemeralAllocationMetadata cb_allocation_metadata_;
     // Tracks which devices this program has CBs allocated on (for CB memory reporting)
@@ -754,9 +765,6 @@ private:
     // ProgramDescriptor ctor path or a legacy CreateKernel program).
     bool created_from_spec_ = false;
 
-    // Semaphores
-    std::vector<Semaphore> semaphores_;
-
     std::unordered_set<uint64_t> compiled_;
     bool local_circular_buffer_allocation_needed_{false};
     bool local_dataflow_buffer_allocation_needed_{false};
@@ -799,6 +807,8 @@ private:
         const CoreCoord& core,
         bool core_has_remapper);
 
+    CBHandle add_circular_buffer_(const std::shared_ptr<CircularBufferImpl>& circular_buffer);
+
     void set_remote_circular_buffer_init(const std::shared_ptr<Kernel>& kernel) const;
 
     // Set data format and tile metadata in `build_options` for every circular buffer
@@ -827,7 +837,6 @@ private:
         SubDeviceId sub_device_id,
         bool use_prefetcher_cache);
 
-    friend class Metal1ProgramBuilder;
     friend HWCommandQueue;
     friend EnqueueProgramCommand;
     friend Program;

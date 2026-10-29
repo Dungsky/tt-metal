@@ -61,7 +61,6 @@
 #include <program.hpp>
 #include "program/dispatch.hpp"
 #include "program/program_impl.hpp"
-#include "impl/program/program_builder.hpp"
 #include "program/slow_dispatch.hpp"
 #include "impl/dataflow_buffer/cross_node_dfb.hpp"
 #include "impl/buffers/semaphore.hpp"
@@ -652,14 +651,14 @@ KernelHandle CreateDataMovementKernel(
         kernel->add_defines(fabric_defines);
     }
 
-    return detail::Metal1ProgramBuilder(program.impl()).add_kernel(kernel, HalProgrammableCoreType::TENSIX);
+    return program.impl().add_kernel(kernel, HalProgrammableCoreType::TENSIX);
 }
 
 KernelHandle CreateComputeKernel(
     Program& program, const KernelSource& kernel_src, const CoreRangeSet& core_range_set, const ComputeConfig& config) {
     std::shared_ptr<Kernel> kernel =
         std::make_shared<ComputeKernel>(program.impl().get_context_id(), kernel_src, core_range_set, config);
-    return detail::Metal1ProgramBuilder(program.impl()).add_kernel(kernel, HalProgrammableCoreType::TENSIX);
+    return program.impl().add_kernel(kernel, HalProgrammableCoreType::TENSIX);
 }
 
 KernelHandle CreateEthernetKernel(
@@ -777,7 +776,7 @@ KernelHandle CreateEthernetKernel(
             kernel->name(),
             config.noc_mode);
     }
-    return detail::Metal1ProgramBuilder(program.impl()).add_kernel(kernel, eth_core_type);
+    return program.impl().add_kernel(kernel, eth_core_type);
 }
 
 void ValidateKernelConfigDefines(const std::map<std::string, std::string>& defines) {
@@ -868,7 +867,7 @@ static KernelHandle CreateDramKernel(
         metal_context.hal().has_programmable_core_type(HalProgrammableCoreType::DRAM),
         "DRAM programmable cores are not enabled; they auto-enable on Blackhole with firmware >= 19.12.0.0.");
     std::shared_ptr<Kernel> kernel = std::make_shared<DramKernel>(context_id, kernel_src, core_range_set, config);
-    return detail::Metal1ProgramBuilder(program.impl()).add_kernel(kernel, HalProgrammableCoreType::DRAM);
+    return program.impl().add_kernel(kernel, HalProgrammableCoreType::DRAM);
 }
 
 KernelHandle CreateKernel(
@@ -899,7 +898,7 @@ CBHandle CreateCircularBuffer(
     const CircularBufferConfig& config) {
     LIGHT_METAL_TRACE_FUNCTION_ENTRY();
     CoreRangeSet core_ranges = detail::GetCoreRangeSet(core_spec);
-    auto cb_handle = detail::Metal1ProgramBuilder(program.impl()).add_circular_buffer(core_ranges, config);
+    auto cb_handle = program.impl().add_circular_buffer(core_ranges, config);
     LIGHT_METAL_TRACE_FUNCTION_CALL(CaptureCreateCircularBuffer, cb_handle, program, core_spec, config);
     return cb_handle;
 }
@@ -975,7 +974,7 @@ uint32_t CreateSemaphore(
             },
         },
         core_spec);
-    return detail::Metal1ProgramBuilder(program.impl()).create_semaphore(crs, initial_value, core_type);
+    return program.impl().create_semaphore(crs, initial_value, core_type);
 }
 
 GlobalSemaphore CreateGlobalSemaphore(
@@ -1128,8 +1127,7 @@ CBHandle CreateCircularBuffer(
     const CircularBufferConfig& config,
     const GlobalCircularBuffer& global_circular_buffer) {
     CoreRangeSet core_ranges = detail::GetCoreRangeSet(core_spec);
-    return detail::Metal1ProgramBuilder(program.impl())
-        .add_circular_buffer(core_ranges, config, global_circular_buffer);
+    return program.impl().add_circular_buffer(core_ranges, config, global_circular_buffer);
 }
 
 void UpdateDynamicCircularBufferAddress(

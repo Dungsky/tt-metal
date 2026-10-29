@@ -11,7 +11,6 @@
 #include <enchantum/enchantum.hpp>
 #include "tt_metal/detail/reports/memory_reporter.hpp"
 #include "impl/buffers/semaphore.hpp"
-#include "impl/program/program_builder.hpp"
 #include <numeric>
 #include <ranges>
 #include <tt_align.hpp>
@@ -449,9 +448,9 @@ detail::ProgramImpl::ProgramImpl(ContextId context_id) :
     context_id_(context_id),
     programmable_core_count_(MetalContext::instance(context_id).hal().get_programmable_core_type_count()),
     max_dfbs_(MetalContext::instance(context_id).hal().get_num_dataflow_buffers()),
+    builder_(programmable_core_count_, max_dfbs_),
     id(program_counter++) {
     for (uint32_t i = 0; i < programmable_core_count_; i++) {
-        kernels_.push_back({});
         grid_extent_.push_back({});
         kernel_groups_.push_back({});
         core_to_kernel_group_index_table_.push_back({});
@@ -497,12 +496,11 @@ Program::Program(const ProgramDescriptor& descriptor) : internal_(std::make_shar
     }
 
     for (const auto& cb_descriptor : descriptor.cbs) {
-        detail::Metal1ProgramBuilder(*internal_)
-            .add_circular_buffer_(std::make_shared<CircularBufferImpl>(cb_descriptor));
+        internal_->add_circular_buffer_(std::make_shared<CircularBufferImpl>(cb_descriptor));
     }
 
     for (const auto& semaphore_descriptor : descriptor.semaphores) {
-        detail::Metal1ProgramBuilder(*internal_).add_semaphore(
+        internal_->add_semaphore(
             semaphore_descriptor.core_ranges,
             semaphore_descriptor.id,
             semaphore_descriptor.initial_value,
@@ -592,18 +590,32 @@ Program::Program(const ProgramDescriptor& descriptor) : internal_(std::make_shar
     }
 }
 
-std::shared_ptr<Kernel> detail::ProgramImpl::get_kernel(KernelHandle kernel_id) const {
-    // TT_ASSERT(kernel_id < this->kernels_.size(), "Expected Kernel with ID {} to be in Program {}", kernel_id,
-    // this->id);
-    //  find coretype based on kernel_id
-    for (const auto& kernels : this->kernels_) {
-        if (kernels.contains(kernel_id)) {
-            return kernels.at(kernel_id);
-        }
+KernelHandle detail::ProgramImpl::add_kernel(
+    const std::shared_ptr<Kernel>& kernel, const HalProgrammableCoreType& programmable_core_type) {
+    TT_FATAL(this->compiled_.empty(), "Cannot add kernel to an already compiled program {}", this->id);
+
+    // Metal 2.0 kernels (with named bindings, e.g. dfb::/tensor::/args::) are only legal on Metal 2.0 Programs
+    if (kernel->is_metal2_kernel()) {
+        TT_FATAL(
+            this->created_from_spec_,
+            "Internal error: Metal 2.0 named bindings (dfb::/sem::/tensor::/args::) are only valid in a "
+            "Metal 2.0 Program (created from a ProgramSpec).");
     }
 
-    TT_ASSERT(false, "Did not find kernel id across all core types!");
-    return nullptr;
+    uint32_t index = MetalContext::instance(context_id_).hal().get_programmable_core_type_index(programmable_core_type);
+    KernelHandle kernel_handle = builder_.add_kernel(kernel, index);
+
+    if (!kernel->scratchpad_binding_handles().empty()) {
+        register_ephemeral_allocation(this->dfb_allocation_metadata_, kernel->core_range_set());
+    }
+
+    kernel_groups_[index].resize(0);
+    core_to_kernel_group_index_table_[index].clear();
+    return kernel_handle;
+}
+
+std::shared_ptr<Kernel> detail::ProgramImpl::get_kernel(KernelHandle kernel_id) const {
+    return builder_.get_kernel(kernel_id);
 }
 
 // ============================================================================
@@ -881,7 +893,7 @@ std::vector<detail::KernelMeta> detail::collect_kernel_meta(const Program& progr
 std::vector<detail::KernelMeta> ProgramImpl::collect_kernel_meta(IDevice* device) const {
     std::vector<detail::KernelMeta> result;
     result.reserve(this->num_kernels());
-    for (const auto& m : this->kernels_) {
+    for (const auto& m : builder_.kernels()) {
         for (const auto& [id, kernel] : m) {
             result.push_back(kernel->meta(device));
         }
@@ -1060,7 +1072,7 @@ std::vector<std::shared_ptr<KernelGroup>>& detail::ProgramImpl::get_kernel_group
 
 std::unordered_map<KernelHandle, std::shared_ptr<Kernel>>& detail::ProgramImpl::get_kernels(
     uint32_t programmable_core_type_index) {
-    return this->kernels_.at(programmable_core_type_index);
+    return builder_.kernels().at(programmable_core_type_index);
 }
 
 KernelGroup* detail::ProgramImpl::kernels_on_core(const CoreCoord& core, uint32_t programmable_core_type_index) {
@@ -1080,7 +1092,7 @@ void detail::ProgramImpl::update_kernel_groups(uint32_t programmable_core_type_i
         // Get the extent of the kernels in x, y
         CoreCoord base = {std::numeric_limits<decltype(base.x)>::max(), std::numeric_limits<decltype(base.y)>::max()};
         grid_extent_[programmable_core_type_index] = {0, 0};
-        const auto& handle_to_kernel = kernels_[programmable_core_type_index];
+        const auto& handle_to_kernel = builder_.kernels()[programmable_core_type_index];
         for (const auto& [id, kernel] : handle_to_kernel) {
             for (auto core : kernel->logical_cores()) {
                 grid_extent_[programmable_core_type_index].x =
@@ -1148,8 +1160,8 @@ void detail::ProgramImpl::update_kernel_groups(uint32_t programmable_core_type_i
                             continue;
                         }
                         auto core = CoreCoord({x, y});
-                        auto local_val = per_core_local_cb_indices_.find(core);
-                        if (local_val != per_core_local_cb_indices_.end() && local_val->second.any()) {
+                        auto local_val = builder_.per_core_local_cb_indices().find(core);
+                        if (local_val != builder_.per_core_local_cb_indices().end() && local_val->second.any()) {
                             uint64_t used_cbs = local_val->second.to_ullong();
                             local_cb_mask |= used_cbs;
                             uint32_t calculated_index =
@@ -1211,8 +1223,8 @@ void detail::ProgramImpl::update_kernel_groups(uint32_t programmable_core_type_i
                                 }
                             }
                         }
-                        auto remote_val = per_core_remote_cb_indices_.find(core);
-                        if (remote_val != per_core_remote_cb_indices_.end() && remote_val->second.any()) {
+                        auto remote_val = builder_.per_core_remote_cb_indices().find(core);
+                        if (remote_val != builder_.per_core_remote_cb_indices().end() && remote_val->second.any()) {
                             min_remote_cb_start_index = std::min(
                                 min_remote_cb_start_index,
                                 static_cast<uint32_t>(__builtin_ctzll(remote_val->second.to_ullong())));
@@ -1275,10 +1287,71 @@ void detail::ProgramImpl::update_kernel_groups(uint32_t programmable_core_type_i
     }
 }
 
+CBHandle detail::ProgramImpl::add_circular_buffer_(const std::shared_ptr<CircularBufferImpl>& circular_buffer) {
+    // Metal 2.0 programs use DataflowBuffers, never legacy circular buffers.
+    TT_FATAL(
+        !this->created_from_spec_,
+        "Cannot add a legacy circular buffer to a Metal 2.0 Program; "
+        "Metal 2.0 Programs use DataflowBuffers, and cannot be modified after construction.");
+
+    builder_.validate_circular_buffer_indices(*circular_buffer);
+
+    // Globally allocated circular buffer do not invalidate allocation because their addresses are tracked by memory
+    // allocator
+    if (not circular_buffer->globally_allocated()) {
+        this->invalidate_circular_buffer_allocation();
+    } else {
+        circular_buffer->assign_global_address();
+        // invalidate_circular_buffer_allocation() would have done this; adding a buffer still means
+        // the program has to be laid out again.
+        this->compile_and_allocate_needed_ = true;
+    }
+
+    CBHandle handle = builder_.add_circular_buffer(circular_buffer);
+
+    // A globally allocated CB does need l1 allocation
+    if (!circular_buffer->globally_allocated()) {
+        register_ephemeral_allocation(this->cb_allocation_metadata_, circular_buffer->core_ranges());
+    }
+    return handle;
+}
+
+CBHandle detail::ProgramImpl::add_circular_buffer(
+    const CoreRangeSet& core_range_set, const CircularBufferConfig& config) {
+    TT_FATAL(this->compiled_.empty(), "Cannot add circular buffer to an already compiled program {}", this->id);
+    TT_FATAL(
+        this->dataflow_buffers_.empty(), "Cannot add circular buffer to a program that already has dataflow buffers");
+    // Merge ranges to reduce the number of multicasts needed to initialize CBs.
+    std::shared_ptr<CircularBufferImpl> circular_buffer =
+        std::make_shared<CircularBufferImpl>(core_range_set.merge_ranges(), config);
+    return add_circular_buffer_(circular_buffer);
+}
+
+CBHandle detail::ProgramImpl::add_circular_buffer(
+    const CoreRangeSet& core_range_set,
+    const CircularBufferConfig& config,
+    const experimental::GlobalCircularBuffer& global_circular_buffer) {
+    TT_FATAL(this->compiled_.empty(), "Cannot add circular buffer to an already compiled program {}", this->id);
+    TT_FATAL(
+        this->dataflow_buffers_.empty(), "Cannot add circular buffer to a program that already has dataflow buffers");
+    TT_FATAL(
+        this->per_core_cross_node_dfbs_.empty(),
+        "Cannot add a GlobalCircularBuffer to a program that already has CrossNodeDFB participants. "
+        "GlobalCircularBuffer and CrossNodeDFB are mutually exclusive within a program.");
+    TT_FATAL(
+        this->per_core_prefetcher_pipes_.empty(),
+        "Cannot add a GlobalCircularBuffer to a program that already has PrefetcherPipe attachments. "
+        "GlobalCircularBuffer and PrefetcherPipe are mutually exclusive within a program.");
+    // Merge ranges to reduce the number of multicasts needed to initialize CBs.
+    std::shared_ptr<CircularBufferImpl> circular_buffer =
+        std::make_shared<CircularBufferImpl>(core_range_set.merge_ranges(), config, global_circular_buffer);
+    return add_circular_buffer_(circular_buffer);
+}
+
 uint8_t detail::ProgramImpl::add_cross_node_dfb(experimental::CrossNodeDFB gdfb) {
     TT_FATAL(this->compiled_.empty(), "Cannot add CrossNodeDFB to an already compiled program {}", this->id);
     // Check mutual exclusion: GlobalCircularBuffer and CrossNodeDFB cannot coexist in the same program.
-    for (const auto& [core, remote_bits] : per_core_remote_cb_indices_) {
+    for (const auto& [core, remote_bits] : builder_.per_core_remote_cb_indices()) {
         TT_FATAL(
             !remote_bits.any(),
             "Cannot add a CrossNodeDFB to a program that already has GlobalCircularBuffers. "
@@ -1330,7 +1403,7 @@ uint8_t detail::ProgramImpl::reserve_prefetcher_pipe_slot(
     uint32_t num_credit_lanes) {
     TT_FATAL(this->compiled_.empty(), "Cannot add a PrefetcherPipe slot to an already compiled program {}", this->id);
 
-    for (const auto& [core, remote_bits] : per_core_remote_cb_indices_) {
+    for (const auto& [core, remote_bits] : builder_.per_core_remote_cb_indices()) {
         TT_FATAL(
             !remote_bits.any(),
             "Cannot attach PrefetcherPipe to a program that already has GlobalCircularBuffers. "
@@ -1946,17 +2019,17 @@ void detail::ProgramImpl::update_dynamic_cross_node_dfb_address(uint8_t remote_d
 }
 
 std::shared_ptr<CircularBufferImpl> detail::ProgramImpl::get_circular_buffer(CBHandle cb_id) const {
-    if (!this->circular_buffer_by_id_.contains(cb_id)) {
+    if (!builder_.circular_buffer_by_id().contains(cb_id)) {
         TT_THROW("No circular buffer with id {} exists in Program {}", cb_id, this->id);
     }
-    return this->circular_buffer_by_id_.at(cb_id);
+    return builder_.circular_buffer_by_id().at(cb_id);
 }
 
 std::vector<std::shared_ptr<CircularBufferImpl>> detail::ProgramImpl::circular_buffers_on_core(
     const CoreCoord& core) const {
     std::vector<std::shared_ptr<CircularBufferImpl>> cbs_on_core;
-    cbs_on_core.reserve(circular_buffers_.size());
-    for (const auto& circular_buffer : circular_buffers_) {
+    cbs_on_core.reserve(builder_.circular_buffers().size());
+    for (const auto& circular_buffer : builder_.circular_buffers()) {
         if (circular_buffer->is_on_logical_core(core)) {
             cbs_on_core.push_back(circular_buffer);
         }
@@ -1967,8 +2040,8 @@ std::vector<std::shared_ptr<CircularBufferImpl>> detail::ProgramImpl::circular_b
 std::vector<std::shared_ptr<CircularBufferImpl>> detail::ProgramImpl::circular_buffers_on_corerange(
     const CoreRange& cr) const {
     std::vector<std::shared_ptr<CircularBufferImpl>> cbs_on_core;
-    cbs_on_core.reserve(circular_buffers_.size());
-    for (const auto& circular_buffer : circular_buffers_) {
+    cbs_on_core.reserve(builder_.circular_buffers().size());
+    for (const auto& circular_buffer : builder_.circular_buffers()) {
         if (circular_buffer->is_on_logical_corerange(cr)) {
             cbs_on_core.push_back(circular_buffer);
         }
@@ -1979,12 +2052,12 @@ std::vector<std::shared_ptr<CircularBufferImpl>> detail::ProgramImpl::circular_b
 std::vector<CoreRange> detail::ProgramImpl::circular_buffers_unique_coreranges() const {
     std::vector<CoreRange> core_ranges;
     size_t max_core_ranges = 0;
-    for (const auto& circular_buffer : circular_buffers_) {
+    for (const auto& circular_buffer : builder_.circular_buffers()) {
         max_core_ranges += circular_buffer->core_ranges().ranges().size();
     }
     core_ranges.reserve(max_core_ranges);
 
-    for (const auto& circular_buffer : circular_buffers_) {
+    for (const auto& circular_buffer : builder_.circular_buffers()) {
         for (const CoreRange& core_range : circular_buffer->core_ranges().ranges()) {
             if (std::find(core_ranges.begin(), core_ranges.end(), core_range) == core_ranges.end()) {
                 core_ranges.push_back(core_range);
@@ -2062,7 +2135,7 @@ void detail::ProgramImpl::prepare_ephemeral_allocation(const IDevice* device) {
     // Shared scratchpads allocate over the union of their binders' nodes. Register
     // those exact ranges before initializing region bases and allocating DFBs.
     std::unordered_map<ScratchpadBindingHandle::AllocationIdentifier, CoreRangeSet> shared_cores;
-    for (const auto& kernels_of_core_type : this->kernels_) {
+    for (const auto& kernels_of_core_type : builder_.kernels()) {
         for (const auto& [kernel_handle, kernel] : kernels_of_core_type) {
             for (const auto& handle : kernel->scratchpad_binding_handles()) {
                 if (handle.shared_allocation_identifier) {
@@ -2130,7 +2203,7 @@ void detail::ProgramImpl::allocate_scratchpads(const IDevice* device) {
         multi_binded_scratchpads;
 
     // Going through all single-binded scratchpads
-    for (auto& kernels_of_core_type : this->kernels_) {
+    for (auto& kernels_of_core_type : builder_.kernels()) {
         for (auto& [kernel_handle, kernel] : kernels_of_core_type) {
             auto& scratchpad_handles = kernel->scratchpad_binding_handles();
             if (scratchpad_handles.empty()) {
@@ -2201,9 +2274,9 @@ void detail::ProgramImpl::allocate_circular_buffers(const IDevice* device) {
     // If CB layout already calculated, skip allocation but report for new devices
     if (not this->local_circular_buffer_allocation_needed_) {
         // Report CB allocations for any NEW devices (using cached addresses)
-        if (!new_devices.empty() && !this->circular_buffers_.empty()) {
+        if (!new_devices.empty() && !builder_.circular_buffers().empty()) {
             for (const IDevice* dev : new_devices) {
-                for (const auto& circular_buffer : this->circular_buffers_) {
+                for (const auto& circular_buffer : builder_.circular_buffers()) {
                     if (!circular_buffer->globally_allocated()) {
                         tt::tt_metal::GraphTracker::instance().track_allocate_cb(
                             circular_buffer->core_ranges(),
@@ -2227,7 +2300,7 @@ void detail::ProgramImpl::allocate_circular_buffers(const IDevice* device) {
         return;
     }
 
-    for (const auto& circular_buffer : this->circular_buffers_) {
+    for (const auto& circular_buffer : builder_.circular_buffers()) {
         if (circular_buffer->globally_allocated()) {
             // Track globally allocated CBs too (they use L1 memory allocated via the allocator)
             for (const IDevice* dev : devices_to_track) {
@@ -2324,7 +2397,7 @@ std::map<CoreCoord, std::vector<std::pair<uint64_t, uint64_t>>> detail::ProgramI
 void detail::ProgramImpl::deallocate_circular_buffers() {
     // Deallocate all circular buffers for this program on ALL devices
     // This notifies the GraphTracker to report deallocations
-    if (!this->cb_devices_.empty() && !this->circular_buffers_.empty()) {
+    if (!this->cb_devices_.empty() && !builder_.circular_buffers().empty()) {
         for (const IDevice* idevice : this->cb_devices_) {
             tt::tt_metal::GraphTracker::instance().track_deallocate_cb(idevice);
         }
@@ -2488,7 +2561,7 @@ void detail::ProgramImpl::validate_circular_buffer_core_ranges(const IDevice* de
         }
         return true;
     };
-    for (const auto& cb : circular_buffers_) {
+    for (const auto& cb : builder_.circular_buffers()) {
         for (const auto& cr : cb->core_ranges().ranges()) {
             const bool in_worker_grid = cr.end_coord.x < grid_size.x && cr.end_coord.y < grid_size.y;
             TT_FATAL(
@@ -2521,12 +2594,30 @@ void detail::ProgramImpl::init_semaphores(
     }
 }
 
+void detail::ProgramImpl::add_semaphore(
+    const CoreRangeSet& crs, uint32_t semaphore_id, uint32_t init_value, CoreType core_type) {
+    TT_FATAL(this->compiled_.empty(), "Cannot add semaphore to an already compiled program {}", this->id);
+    const uint32_t l1_alignment = MetalContext::instance(context_id_).hal().get_alignment(HalMemType::L1);
+    builder_.add_semaphore(crs, semaphore_id, init_value, l1_alignment, core_type);
+}
+
+uint32_t detail::ProgramImpl::create_semaphore(const CoreRangeSet& crs, uint32_t initial_value, CoreType core_type) {
+    TT_FATAL(!crs.ranges().empty(), "Expecting a non-empty CoreRangeSet!");
+    TT_FATAL(
+        MetalContext::instance(context_id_).is_coord_in_range(crs.ranges().back().end_coord, core_type),
+        "Coordinates out of range");
+
+    uint32_t semaphore_id = builder_.allocate_semaphore_id(crs, core_type);
+    this->add_semaphore(crs, semaphore_id, initial_value, core_type);
+    return semaphore_id;
+}
+
 std::vector<std::vector<CoreCoord>> detail::ProgramImpl::logical_cores() const {
     std::vector<std::vector<CoreCoord>> cores_in_program;
     std::vector<std::set<CoreCoord>> unique_cores;
-    for (uint32_t programmable_core_type_index = 0; programmable_core_type_index < kernels_.size();
+    for (uint32_t programmable_core_type_index = 0; programmable_core_type_index < builder_.kernels().size();
          programmable_core_type_index++) {
-        const auto& kernels = this->kernels_[programmable_core_type_index];
+        const auto& kernels = builder_.kernels()[programmable_core_type_index];
         cores_in_program.push_back({});
         unique_cores.push_back({});
         for (const auto& [id, kernel] : kernels) {
@@ -2639,7 +2730,7 @@ void detail::ProgramImpl::populate_dispatch_data(IDevice* device) {
     // Map is used to look up transfer info by kernel id when we populate data ordered by core groups
     std::unordered_map<KernelHandle, kernel_bins_transfer_info> kernel_transfer_info;
     // This is generic for workers and eth cores
-    for (const auto& kernels : this->kernels_) {
+    for (const auto& kernels : builder_.kernels()) {
         for (const auto& [kernel_id, kernel] : kernels) {
             const auto& binaries = kernel->binaries(BuildEnvManager::get_instance(extract_context_id(device))
                                                         .get_device_build_env(device->build_id())
@@ -3055,7 +3146,7 @@ void detail::ProgramImpl::compile(IDevice* device, bool force_slow_dispatch) {
 
     // Validate every kernel before starting any build: a throw after a local task launches would unwind
     // locals it still references, and a throw after a remote submit would leave its dedup entry pending.
-    for (const auto& kernels : kernels_) {
+    for (const auto& kernels : builder_.kernels()) {
         for (const auto& [id, kernel] : kernels) {
             validate_kernel_placement(force_slow_dispatch, kernel, device->build_id());
         }
@@ -3080,13 +3171,13 @@ void detail::ProgramImpl::compile(IDevice* device, bool force_slow_dispatch) {
         std::vector<std::shared_ptr<Kernel>> preprocessed_kernels;
 
         size_t total_kernels = 0;
-        for (const auto& kernels : kernels_) {
+        for (const auto& kernels : builder_.kernels()) {
             total_kernels += kernels.size();
         }
         submitted_kernels.reserve(total_kernels);
         preprocessed_kernels.reserve(total_kernels);
 
-        for (auto& kernels : kernels_) {
+        for (auto& kernels : builder_.kernels()) {
             for (auto& [id, kernel] : kernels) {
                 auto [build_options, kernel_hash] = prep_kernel(kernel);
                 // Skip the remote round-trip when the ELF is already validly cached locally.
@@ -3121,7 +3212,7 @@ void detail::ProgramImpl::compile(IDevice* device, bool force_slow_dispatch) {
         // Local path: parallel build via thread pool.
         std::mutex deferred_mutex;
         std::vector<std::tuple<std::shared_ptr<Kernel>, JitBuildOptions, size_t>> deferred;
-        for (auto& kernels : kernels_) {
+        for (auto& kernels : builder_.kernels()) {
             for (auto& [id, kernel] : kernels) {
                 launch_build_step(
                     [&, kernel] {
@@ -3289,16 +3380,10 @@ ProgramId detail::ProgramImpl::get_runtime_id() const { return this->runtime_id;
 
 ProgramId Program::get_runtime_id() const { return internal_->get_runtime_id(); }
 
-size_t detail::ProgramImpl::num_kernels() const {
-    size_t count = 0;
-    for (const auto& kernels : kernels_) {
-        count += kernels.size();
-    }
-    return count;
-}
+size_t detail::ProgramImpl::num_kernels() const { return builder_.num_kernels(); }
 
 std::span<const std::shared_ptr<CircularBufferImpl>> detail::ProgramImpl::circular_buffers() const {
-    return circular_buffers_;
+    return builder_.circular_buffers();
 }
 
 std::vector<std::shared_ptr<CircularBuffer>> Program::circular_buffers() const {
@@ -3308,7 +3393,7 @@ std::vector<std::shared_ptr<CircularBuffer>> Program::circular_buffers() const {
     return {res_view.begin(), res_view.end()};
 }
 
-const std::vector<Semaphore>& detail::ProgramImpl::semaphores() const { return semaphores_; }
+const std::vector<Semaphore>& detail::ProgramImpl::semaphores() const { return builder_.semaphores(); }
 
 void detail::ProgramImpl::add_buffer(std::shared_ptr<Buffer> buf) { owned_buffer_pool.push_back(std::move(buf)); }
 
@@ -3316,14 +3401,7 @@ void detail::ProgramImpl::release_buffers() { owned_buffer_pool = {}; }
 
 std::vector<std::reference_wrapper<const Semaphore>> detail::ProgramImpl::semaphores_on_core(
     const CoreCoord& core, CoreType core_type) const {
-    std::vector<std::reference_wrapper<const Semaphore>> semaphores;
-    semaphores.reserve(this->semaphores_.size());
-    for (const Semaphore& s : this->semaphores_) {
-        if (s.initialized_on_logical_core(core) && s.core_type() == core_type) {
-            semaphores.emplace_back(std::cref(s));
-        }
-    }
-    return semaphores;
+    return builder_.semaphores_on_core(core, core_type);
 }
 
 bool detail::ProgramImpl::is_finalized() const { return this->finalized_; }

@@ -6,20 +6,18 @@
 
 #include <bitset>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <set>
+#include <unordered_set>
 
 #include <tt_stl/assert.hpp>
 #include "circular_buffer_constants.h"
 #include "core_coord.hpp"
-#include "hal_types.hpp"
 #include "impl/buffers/circular_buffer.hpp"
 #include "impl/buffers/semaphore.hpp"
-#include "impl/context/metal_context.hpp"
 #include "impl/kernels/kernel.hpp"
-#include "program_allocation_support.hpp"
-#include "program_impl.hpp"
 
 namespace tt::tt_metal::detail {
 
@@ -37,32 +35,23 @@ std::bitset<MAX_PROCESSOR_TYPES_COUNT> get_kernel_processor_set(const Kernel& ke
 
 }  // namespace
 
+Metal1ProgramBuilder::Metal1ProgramBuilder(uint32_t programmable_core_count, uint32_t max_circular_buffers) :
+    max_circular_buffers_(max_circular_buffers), kernels_(programmable_core_count) {}
+
 KernelHandle Metal1ProgramBuilder::add_kernel(
-    const std::shared_ptr<Kernel>& kernel, const HalProgrammableCoreType& programmable_core_type) {
-    TT_FATAL(program_.compiled_.empty(), "Cannot add kernel to an already compiled program {}", program_.id);
-
-    // Metal 2.0 kernels (with named bindings, e.g. dfb::/tensor::/args::) are only legal on Metal 2.0 Programs
-    if (kernel->is_metal2_kernel()) {
-        TT_FATAL(
-            program_.created_from_spec_,
-            "Internal error: Metal 2.0 named bindings (dfb::/sem::/tensor::/args::) are only valid in a "
-            "Metal 2.0 Program (created from a ProgramSpec).");
-    }
-
+    const std::shared_ptr<Kernel>& kernel, uint32_t programmable_core_type_index) {
     // Id is unique across all kernels on all core types
-    KernelHandle id = program_.num_kernels();
-    uint32_t index =
-        MetalContext::instance(program_.context_id_).hal().get_programmable_core_type_index(programmable_core_type);
+    KernelHandle id = num_kernels();
 
     auto new_kernel_core_type = kernel->get_kernel_programmable_core_type();
     auto new_kernel_processor_class = kernel->get_kernel_processor_class();
 
     std::set<CoreCoord> kernel_logical_cores = kernel->logical_cores();
     auto new_kernel_processor_set = get_kernel_processor_set(*kernel);
-    for (size_t i = 0; i < program_.num_kernels(); i++) {
+    for (size_t i = 0; i < num_kernels(); i++) {
         // Note, looks like id is program specific, and increments naturally as kernels are added.
         //  add_kernel -> id = num_kernels -> kernel is inserted -> next num_kernels() increments.
-        std::shared_ptr<Kernel> check_kernel = program_.get_kernel(i);
+        std::shared_ptr<Kernel> check_kernel = get_kernel(i);
         auto check_kernel_core_type = check_kernel->get_kernel_programmable_core_type();
         auto check_kernel_processor_class = check_kernel->get_kernel_processor_class();
         if (check_kernel_core_type == new_kernel_core_type &&
@@ -81,58 +70,56 @@ KernelHandle Metal1ProgramBuilder::add_kernel(
         }
     }
 
-    if (!kernel->scratchpad_binding_handles().empty()) {
-        register_ephemeral_allocation(program_.dfb_allocation_metadata_, kernel->core_range_set());
-    }
-
-    program_.kernels_[index].insert({id, kernel});
-    program_.kernel_groups_[index].resize(0);
-    program_.core_to_kernel_group_index_table_[index].clear();
+    kernels_[programmable_core_type_index].insert({id, kernel});
     return id;
 }
 
-CBHandle Metal1ProgramBuilder::add_circular_buffer_(const std::shared_ptr<CircularBufferImpl>& circular_buffer) {
-    // Metal 2.0 programs use DataflowBuffers, never legacy circular buffers.
-    TT_FATAL(
-        !program_.created_from_spec_,
-        "Cannot add a legacy circular buffer to a Metal 2.0 Program; "
-        "Metal 2.0 Programs use DataflowBuffers, and cannot be modified after construction.");
-
-    // The deserialization constructor sets these sets independently, so local and remote are not
-    // guaranteed to be subsets of buffer_indices; all three index the per-core bitsets below.
-    const CircularBufferConfig& config = circular_buffer->config();
-    for (const auto* indices :
-         {&config.buffer_indices(), &config.local_buffer_indices(), &config.remote_buffer_indices()}) {
-        for (uint32_t buffer_index : *indices) {
-            if (buffer_index >= program_.max_dfbs_) {
-                TT_THROW(
-                    "Buffer index ({}) exceeds max number of circular buffers per core ({})",
-                    buffer_index,
-                    program_.max_dfbs_);
-            }
+std::shared_ptr<Kernel> Metal1ProgramBuilder::get_kernel(KernelHandle kernel_id) const {
+    // find coretype based on kernel_id
+    for (const auto& kernels : kernels_) {
+        if (kernels.contains(kernel_id)) {
+            return kernels.at(kernel_id);
         }
     }
 
-    // Globally allocated circular buffer do not invalidate allocation because their addresses are tracked by memory
-    // allocator
-    if (not circular_buffer->globally_allocated()) {
-        program_.invalidate_circular_buffer_allocation();
-    } else {
-        circular_buffer->assign_global_address();
-        // invalidate_circular_buffer_allocation() would have done this; adding a buffer still means
-        // the program has to be laid out again.
-        program_.compile_and_allocate_needed_ = true;
-    }
+    TT_ASSERT(false, "Did not find kernel id across all core types!");
+    return nullptr;
+}
 
+size_t Metal1ProgramBuilder::num_kernels() const {
+    size_t count = 0;
+    for (const auto& kernels : kernels_) {
+        count += kernels.size();
+    }
+    return count;
+}
+
+void Metal1ProgramBuilder::validate_circular_buffer_indices(const CircularBufferImpl& circular_buffer) const {
+    // The deserialization constructor sets these sets independently, so local and remote are not
+    // guaranteed to be subsets of buffer_indices; all three index the per-core bitsets.
+    const CircularBufferConfig& config = circular_buffer.config();
+    for (const auto* indices :
+         {&config.buffer_indices(), &config.local_buffer_indices(), &config.remote_buffer_indices()}) {
+        for (uint32_t buffer_index : *indices) {
+            if (buffer_index >= max_circular_buffers_) {
+                TT_THROW(
+                    "Buffer index ({}) exceeds max number of circular buffers per core ({})",
+                    buffer_index,
+                    max_circular_buffers_);
+            }
+        }
+    }
+}
+
+CBHandle Metal1ProgramBuilder::add_circular_buffer(const std::shared_ptr<CircularBufferImpl>& circular_buffer) {
     // Mark which buffer indices are being used on each core the circular buffer is used on
     for (const CoreRange& core_range : circular_buffer->core_ranges().ranges()) {
         for (auto x = core_range.start_coord.x; x <= core_range.end_coord.x; x++) {
             for (auto y = core_range.start_coord.y; y <= core_range.end_coord.y; y++) {
                 CoreCoord logical_core(x, y);
-                std::bitset<NUM_CIRCULAR_BUFFERS>& cb_indices = program_.per_core_cb_indices_[logical_core];
-                std::bitset<NUM_CIRCULAR_BUFFERS>& local_cb_indices = program_.per_core_local_cb_indices_[logical_core];
-                std::bitset<NUM_CIRCULAR_BUFFERS>& remote_cb_indices =
-                    program_.per_core_remote_cb_indices_[logical_core];
+                std::bitset<NUM_CIRCULAR_BUFFERS>& cb_indices = per_core_cb_indices_[logical_core];
+                std::bitset<NUM_CIRCULAR_BUFFERS>& local_cb_indices = per_core_local_cb_indices_[logical_core];
+                std::bitset<NUM_CIRCULAR_BUFFERS>& remote_cb_indices = per_core_remote_cb_indices_[logical_core];
                 auto add_buffer_indices = [&cb_indices](
                                               const std::unordered_set<uint8_t>& buffer_indices,
                                               std::bitset<NUM_CIRCULAR_BUFFERS>& target_cb_indices) {
@@ -153,48 +140,10 @@ CBHandle Metal1ProgramBuilder::add_circular_buffer_(const std::shared_ptr<Circul
             }
         }
     }
-    // A globally allocated CB does need l1 allocation
-    if (!circular_buffer->globally_allocated()) {
-        register_ephemeral_allocation(program_.cb_allocation_metadata_, circular_buffer->core_ranges());
-    }
 
-    program_.circular_buffers_.push_back(circular_buffer);
-    program_.circular_buffer_by_id_.insert({circular_buffer->id(), circular_buffer});
+    circular_buffers_.push_back(circular_buffer);
+    circular_buffer_by_id_.insert({circular_buffer->id(), circular_buffer});
     return circular_buffer->id();
-}
-
-CBHandle Metal1ProgramBuilder::add_circular_buffer(
-    const CoreRangeSet& core_range_set, const CircularBufferConfig& config) {
-    TT_FATAL(program_.compiled_.empty(), "Cannot add circular buffer to an already compiled program {}", program_.id);
-    TT_FATAL(
-        program_.dataflow_buffers_.empty(),
-        "Cannot add circular buffer to a program that already has dataflow buffers");
-    // Merge ranges to reduce the number of multicasts needed to initialize CBs.
-    std::shared_ptr<CircularBufferImpl> circular_buffer =
-        std::make_shared<CircularBufferImpl>(core_range_set.merge_ranges(), config);
-    return add_circular_buffer_(circular_buffer);
-}
-
-CBHandle Metal1ProgramBuilder::add_circular_buffer(
-    const CoreRangeSet& core_range_set,
-    const CircularBufferConfig& config,
-    const experimental::GlobalCircularBuffer& global_circular_buffer) {
-    TT_FATAL(program_.compiled_.empty(), "Cannot add circular buffer to an already compiled program {}", program_.id);
-    TT_FATAL(
-        program_.dataflow_buffers_.empty(),
-        "Cannot add circular buffer to a program that already has dataflow buffers");
-    TT_FATAL(
-        program_.per_core_cross_node_dfbs_.empty(),
-        "Cannot add a GlobalCircularBuffer to a program that already has CrossNodeDFB participants. "
-        "GlobalCircularBuffer and CrossNodeDFB are mutually exclusive within a program.");
-    TT_FATAL(
-        program_.per_core_prefetcher_pipes_.empty(),
-        "Cannot add a GlobalCircularBuffer to a program that already has PrefetcherPipe attachments. "
-        "GlobalCircularBuffer and PrefetcherPipe are mutually exclusive within a program.");
-    // Merge ranges to reduce the number of multicasts needed to initialize CBs.
-    std::shared_ptr<CircularBufferImpl> circular_buffer =
-        std::make_shared<CircularBufferImpl>(core_range_set.merge_ranges(), config, global_circular_buffer);
-    return add_circular_buffer_(circular_buffer);
 }
 
 void Metal1ProgramBuilder::validate_semaphore_id(
@@ -205,7 +154,7 @@ void Metal1ProgramBuilder::validate_semaphore_id(
         for (auto x = core_range.start_coord.x; x <= core_range.end_coord.x; x++) {
             for (auto y = core_range.start_coord.y; y <= core_range.end_coord.y; y++) {
                 CoreCoord logical_core(x, y);
-                auto existing_semaphores = program_.semaphores_on_core(logical_core, core_type);
+                auto existing_semaphores = semaphores_on_core(logical_core, core_type);
                 for (const auto& semaphore : existing_semaphores) {
                     TT_FATAL(
                         semaphore.get().id() != semaphore_id,
@@ -219,26 +168,19 @@ void Metal1ProgramBuilder::validate_semaphore_id(
 }
 
 void Metal1ProgramBuilder::add_semaphore(
-    const CoreRangeSet& crs, uint32_t semaphore_id, uint32_t init_value, CoreType core_type) {
-    TT_FATAL(program_.compiled_.empty(), "Cannot add semaphore to an already compiled program {}", program_.id);
+    const CoreRangeSet& crs, uint32_t semaphore_id, uint32_t init_value, uint32_t l1_alignment, CoreType core_type) {
     validate_semaphore_id(crs, semaphore_id, core_type);
-    const uint32_t l1_alignment = MetalContext::instance(program_.context_id_).hal().get_alignment(HalMemType::L1);
-    program_.semaphores_.emplace_back(Semaphore(crs, semaphore_id, init_value, l1_alignment, core_type));
+    semaphores_.emplace_back(Semaphore(crs, semaphore_id, init_value, l1_alignment, core_type));
 }
 
-uint32_t Metal1ProgramBuilder::create_semaphore(const CoreRangeSet& crs, uint32_t initial_value, CoreType core_type) {
-    TT_FATAL(!crs.ranges().empty(), "Expecting a non-empty CoreRangeSet!");
-    TT_FATAL(
-        MetalContext::instance(program_.context_id_).is_coord_in_range(crs.ranges().back().end_coord, core_type),
-        "Coordinates out of range");
-
+uint32_t Metal1ProgramBuilder::allocate_semaphore_id(const CoreRangeSet& crs, CoreType core_type) const {
     std::optional<uint32_t> semaphore_id;
     std::bitset<NUM_SEMAPHORES> used_semaphore_ids;
     for (const auto& core_range : crs.ranges()) {
         for (auto x = core_range.start_coord.x; x <= core_range.end_coord.x; x++) {
             for (auto y = core_range.start_coord.y; y <= core_range.end_coord.y; y++) {
                 CoreCoord logical_core(x, y);
-                auto existing = program_.semaphores_on_core(logical_core, core_type);
+                auto existing = semaphores_on_core(logical_core, core_type);
                 if (existing.size() == NUM_SEMAPHORES) {
                     TT_THROW(
                         "Cannot add semaphore on core {}. Max number of semaphores ({}) reached!",
@@ -262,9 +204,19 @@ uint32_t Metal1ProgramBuilder::create_semaphore(const CoreRangeSet& crs, uint32_
         "Unable to initialize semaphore on CoreRangeSet {}: all {} IDs are in use",
         crs.str(),
         NUM_SEMAPHORES);
-
-    add_semaphore(crs, *semaphore_id, initial_value, core_type);
     return *semaphore_id;
+}
+
+std::vector<std::reference_wrapper<const Semaphore>> Metal1ProgramBuilder::semaphores_on_core(
+    const CoreCoord& core, CoreType core_type) const {
+    std::vector<std::reference_wrapper<const Semaphore>> semaphores;
+    semaphores.reserve(semaphores_.size());
+    for (const Semaphore& s : semaphores_) {
+        if (s.initialized_on_logical_core(core) && s.core_type() == core_type) {
+            semaphores.emplace_back(std::cref(s));
+        }
+    }
+    return semaphores;
 }
 
 }  // namespace tt::tt_metal::detail

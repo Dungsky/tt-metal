@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "impl/metal2_host_api/program_spec/construction/kernel_lowering.hpp"
-#include "impl/program/program_builder.hpp"
 
 #include <algorithm>
 #include <filesystem>
@@ -546,8 +545,7 @@ void AddKernels(
     for (const KernelSpec& kernel_spec : spec.kernels) {
         LoweredKernel lowered =
             LowerKernel(kernel_spec, spec, collected, risc_masks, resources, hal, program_impl.get_context_id());
-        KernelHandle handle =
-            detail::Metal1ProgramBuilder(program_impl).add_kernel(lowered.kernel, HalProgrammableCoreType::TENSIX);
+        KernelHandle handle = program_impl.add_kernel(lowered.kernel, HalProgrammableCoreType::TENSIX);
         program_impl.register_kernel_spec_name(kernel_spec.unique_id.get(), handle);
         program_impl.register_kernel_rta_schema(kernel_spec.unique_id.get(), lowered.rta_schema);
     }

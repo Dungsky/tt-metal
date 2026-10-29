@@ -21,7 +21,6 @@
 #include "host_api/helpers.hpp"
 #include "impl/kernels/kernel.hpp"
 #include "impl/program/program_impl.hpp"
-#include "impl/program/program_builder.hpp"
 
 namespace tt::tt_metal::experimental::quasar {
 
@@ -173,7 +172,7 @@ KernelHandle CreateQuasarDataMovementKernel(
         program, core_ranges, config.num_threads_per_cluster, HalProgrammableCoreType::TENSIX);
     std::shared_ptr<Kernel> kernel = std::make_shared<QuasarDataMovementKernel>(
         program.impl().get_context_id(), kernel_src, core_ranges, config, dm_processors);
-    return detail::Metal1ProgramBuilder(program.impl()).add_kernel(kernel, HalProgrammableCoreType::TENSIX);
+    return program.impl().add_kernel(kernel, HalProgrammableCoreType::TENSIX);
 }
 
 KernelHandle CreateKernel(
@@ -202,7 +201,7 @@ KernelHandle CreateQuasarComputeKernel(
         HalProgrammableCoreType::TENSIX);
     std::shared_ptr<Kernel> kernel = std::make_shared<QuasarComputeKernel>(
         program.impl().get_context_id(), kernel_src, core_ranges, config, compute_processors);
-    return detail::Metal1ProgramBuilder(program.impl()).add_kernel(kernel, HalProgrammableCoreType::TENSIX);
+    return program.impl().add_kernel(kernel, HalProgrammableCoreType::TENSIX);
 }
 
 KernelHandle CreateKernel(

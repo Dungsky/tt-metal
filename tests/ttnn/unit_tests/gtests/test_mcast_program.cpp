@@ -9,8 +9,8 @@ TEST_F(McastHostFixture, ProgramBindingAllocatesOnceAndAppendsResolvedIds) {
     const auto participants = grid({0, 0}, {1, 0});
     auto mcast = make_mcast(device_, {{participants, {{0, 0}}}});
     Program program;
-    tt::tt_metal::detail::Metal1ProgramBuilder(program.impl()).add_semaphore(participants, 0, 7, tt::CoreType::WORKER);
-    tt::tt_metal::detail::Metal1ProgramBuilder(program.impl()).add_semaphore(participants, 2, 9, tt::CoreType::WORKER);
+    program.impl().add_semaphore(participants, 0, 7, tt::CoreType::WORKER);
+    program.impl().add_semaphore(participants, 2, 9, tt::CoreType::WORKER);
     std::vector<uint32_t> ct{71}, rt{73};
     EXPECT_ANY_THROW(mcast.append_compile_time_args_to(ct));
     EXPECT_ANY_THROW(mcast.append_runtime_args_to(rt, {0, 0}));
@@ -58,8 +58,7 @@ TEST_F(McastHostFixture, ProgramBindingCoversChainExhaustionAndUnsupportedProgra
     auto mcast = make_mcast(device_, {{participants, {{0, 0}}}});
     Program full;
     for (uint32_t id = 0; id < NUM_SEMAPHORES; ++id) {
-        tt::tt_metal::detail::Metal1ProgramBuilder(full.impl())
-            .add_semaphore(participants, id, 0, tt::CoreType::WORKER);
+        full.impl().add_semaphore(participants, id, 0, tt::CoreType::WORKER);
     }
     EXPECT_ANY_THROW(mcast.append_semaphores(full));
     EXPECT_EQ(full.impl().semaphores().size(), NUM_SEMAPHORES);

@@ -35,7 +35,6 @@
 #include "impl/metal2_host_api/helpers.hpp"
 #include "impl/metal2_host_api/llk_metadata.hpp"
 #include "impl/context/metal_context.hpp"
-#include "impl/program/program_builder.hpp"
 
 namespace tt::tt_metal::experimental {
 
@@ -191,8 +190,7 @@ SemaphoreHandles RegisterSemaphores(
         const SemaphoreSpecName& semaphore_name = semaphore_spec.unique_id;
         const uint32_t init_value = semaphore_spec.advanced_options.initial_value;
         uint32_t sem_id =
-            detail::Metal1ProgramBuilder(program_impl)
-                .create_semaphore(to_node_range_set(semaphore_spec.target_nodes), init_value, CoreType::WORKER);
+            program_impl.create_semaphore(to_node_range_set(semaphore_spec.target_nodes), init_value, CoreType::WORKER);
         program_impl.register_semaphore_spec_name(semaphore_name.get(), sem_id);
         semaphore_name_to_id[semaphore_name] = sem_id;
     }
