@@ -1623,16 +1623,6 @@ bool ControlPlane::is_fabric_over_noc() const {
 void ControlPlane::configure_routing_tables_for_fabric_over_noc() {
     this->fabric_over_noc_routing_tables_.clear();
 
-    // Horizon uses fabric-over-NOC; there are no Ethernet links between chips.
-    // Populate the ETH channel map with empty entries so callers of
-    // get_active_fabric_eth_channels*() return empty results rather than throwing.
-    this->router_port_directions_to_physical_eth_chan_map_.clear();
-    for (const auto& [fabric_node_id, _] : this->logical_mesh_chip_id_to_physical_chip_id_mapping_) {
-        if (!this->router_port_directions_to_physical_eth_chan_map_.contains(fabric_node_id)) {
-            this->router_port_directions_to_physical_eth_chan_map_[fabric_node_id] = {};
-        }
-    }
-
     for (const auto& [src_node, src_phys] : this->logical_mesh_chip_id_to_physical_chip_id_mapping_) {
         tt::tt_fabric::fabric_over_noc_routing_l1_info_t info = {};
         info.my_mesh_id = *src_node.mesh_id;
