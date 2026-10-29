@@ -16,6 +16,7 @@
 #include "impl/kernels/kernel.hpp"
 #include "impl/kernels/kernel_source.hpp"
 #include "impl/program/program_impl.hpp"
+#include "impl/program/program_builder.hpp"
 
 namespace tt::tt_metal::detail {
 
@@ -34,7 +35,7 @@ KernelHandle create_dispatch_engine_kernel(
     const KernelSource kernel_src = KernelSource::from_path(program.impl().get_context_id(), file_name);
     std::shared_ptr<Kernel> kernel = std::make_shared<experimental::quasar::DispatchEngineKernel>(
         program.impl().get_context_id(), kernel_src, core_ranges, config, dm_processor);
-    return program.impl().add_kernel(kernel, HalProgrammableCoreType::DISPATCH);
+    return detail::Metal1ProgramBuilder(program.impl()).add_kernel(kernel, HalProgrammableCoreType::DISPATCH);
 }
 
 }  // namespace

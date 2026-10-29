@@ -219,6 +219,8 @@ struct BoundTensorFootprint {
 
 BoundTensorFootprint make_bound_tensor_footprint(const MeshTensor& tensor);
 
+class Metal1ProgramBuilder;
+
 // The internal implementation of the Program class. Program is a view of this class that's usable by API clients.
 class ProgramImpl : public std::enable_shared_from_this<ProgramImpl> {
 public:
@@ -362,12 +364,6 @@ public:
         ttsl::Span<ProgramImpl*> programs);
 
     std::vector<uint32_t>& get_program_config_sizes() noexcept { return program_config_sizes_; }
-
-    CBHandle add_circular_buffer(const CoreRangeSet& core_range_set, const CircularBufferConfig& config);
-    CBHandle add_circular_buffer(
-        const CoreRangeSet& core_range_set,
-        const CircularBufferConfig& config,
-        const experimental::GlobalCircularBuffer& global_circular_buffer);
 
     uint32_t add_dataflow_buffer(
         const CoreRangeSet& core_range_set, const experimental::dfb::DataflowBufferConfig& config);
@@ -579,21 +575,6 @@ public:
         std::map<CoreRange, std::vector<std::pair<uint64_t, uint64_t>>>& regions_per_range) const;
     static std::map<CoreCoord, std::vector<std::pair<uint64_t, uint64_t>>> expand_cb_l1_regions_per_core(
         const std::map<CoreRange, std::vector<std::pair<uint64_t, uint64_t>>>& regions_per_range);
-
-    KernelHandle add_kernel(const std::shared_ptr<Kernel>& kernel, const HalProgrammableCoreType& core_type);
-
-    // Allocate the next free semaphore ID on the given cores and insert the semaphore.
-    // Returns the allocated ID; TT_FATALs if no slot can be found.
-    uint32_t create_semaphore(const CoreRangeSet& crs, uint32_t initial_value, CoreType core_type);
-
-    // Insert a semaphore at the caller-specified ID. Used by:
-    //   - Construction paths where the ID is already decided upstream (ProgramDescriptor ctor path).
-    //   - create_semaphore above
-    // The ProgramDescriptor path is something of a hack; it will eventually be deprecated in favor of Metal 2.0.
-    void add_semaphore(const CoreRangeSet& crs, uint32_t semaphore_id, uint32_t init_value, CoreType core_type);
-
-    // Validates that a semaphore ID is within bounds and not already in use on overlapping cores
-    void validate_semaphore_id(const CoreRangeSet& crs, uint32_t semaphore_id, CoreType core_type) const;
 
     bool runs_on_noc_multicast_only_cores();
 
@@ -818,8 +799,6 @@ private:
         const CoreCoord& core,
         bool core_has_remapper);
 
-    CBHandle add_circular_buffer_(const std::shared_ptr<CircularBufferImpl>& circular_buffer);
-
     void set_remote_circular_buffer_init(const std::shared_ptr<Kernel>& kernel) const;
 
     // Set data format and tile metadata in `build_options` for every circular buffer
@@ -848,6 +827,7 @@ private:
         SubDeviceId sub_device_id,
         bool use_prefetcher_cache);
 
+    friend class Metal1ProgramBuilder;
     friend HWCommandQueue;
     friend EnqueueProgramCommand;
     friend Program;
