@@ -60,8 +60,8 @@ namespace {
 //
 // TODO: generalise via ATT route-window query once UMD exposes that information.
 static void write_horizon_x2_routing_tables(tt::Cluster& cluster, const tt::tt_metal::Hal& hal) {
-    using tt::umd::CoordSystem;
-    using tt::umd::CoreType;
+    using tt::CoordSystem;
+    using tt::CoreType;
 
     const uint64_t routing_table_addr =
         hal.get_dev_addr(tt::tt_metal::HalProgrammableCoreType::TENSIX, tt::tt_metal::HalL1MemAddrType::ROUTING_TABLE);
