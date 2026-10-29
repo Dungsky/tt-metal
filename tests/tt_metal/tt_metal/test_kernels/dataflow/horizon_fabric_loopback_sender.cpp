@@ -5,7 +5,7 @@
 // Horizon fabric loopback — sender side (runs on chip 0).
 //
 // 1. Writes `value` to chip `dst_dev_id`'s receive buffer at NOC (dst_noc_x, dst_noc_y)
-//    using the flat address from horizon_routing_l1_info_t (populated by SetFabricConfig).
+//    using the flat address from fabric_over_noc_routing_l1_info_t (populated by SetFabricConfig).
 // 2. Spins on its local echo buffer until the loopback kernel on chip 1 writes back.
 // 3. Exits; host verifies the echo buffer holds the original value.
 //
@@ -16,7 +16,7 @@
 
 #include "api/dataflow/dataflow_api.h"
 #include "experimental/kernel_args.h"
-#include "hostdevcommon/fabric_common.h"  // horizon_routing_l1_info_t
+#include "hostdevcommon/fabric_common.h"  // fabric_over_noc_routing_l1_info_t
 #include "dev_mem_map.h"                  // ROUTING_TABLE_BASE
 
 void kernel_main() {
@@ -33,7 +33,8 @@ void kernel_main() {
 
     // Look up the 64-bit flat address for core (dst_noc_x, dst_noc_y) on device dst_dev_id.
     // flat_addr[mesh][device][noc_x][noc_y] holds the window base; add the L1 byte offset.
-    const auto* rt = reinterpret_cast<const tt_l1_ptr tt::tt_fabric::horizon_routing_l1_info_t*>(ROUTING_TABLE_BASE);
+    const auto* rt =
+        reinterpret_cast<const tt_l1_ptr tt::tt_fabric::fabric_over_noc_routing_l1_info_t*>(ROUTING_TABLE_BASE);
     const uint64_t remote_addr = rt->flat_addr[0][dst_dev_id][dst_noc_x][dst_noc_y] + dst_l1_addr;
 
     noc_async_write(src_addr, remote_addr, sizeof(uint32_t));

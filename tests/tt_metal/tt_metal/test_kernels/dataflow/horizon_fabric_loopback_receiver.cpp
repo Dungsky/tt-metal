@@ -6,12 +6,12 @@
 //
 // 1. Spins on recv_addr until a non-zero value appears (written by the sender on chip 0).
 // 2. Reads the value and writes it back to chip 0's echo buffer at NOC (echo_noc_x, echo_noc_y)
-//    using the flat address from this chip's own horizon_routing_l1_info_t.
+//    using the flat address from this chip's own fabric_over_noc_routing_l1_info_t.
 // 3. Exits.
 
 #include "api/dataflow/dataflow_api.h"
 #include "experimental/kernel_args.h"
-#include "hostdevcommon/fabric_common.h"  // horizon_routing_l1_info_t
+#include "hostdevcommon/fabric_common.h"  // fabric_over_noc_routing_l1_info_t
 #include "dev_mem_map.h"                  // ROUTING_TABLE_BASE
 
 void kernel_main() {
@@ -28,7 +28,8 @@ void kernel_main() {
     const uint32_t value = *recv;
 
     // Echo back to chip 0 via the flat address in our routing table.
-    const auto* rt = reinterpret_cast<const tt_l1_ptr tt::tt_fabric::horizon_routing_l1_info_t*>(ROUTING_TABLE_BASE);
+    const auto* rt =
+        reinterpret_cast<const tt_l1_ptr tt::tt_fabric::fabric_over_noc_routing_l1_info_t*>(ROUTING_TABLE_BASE);
     const uint64_t remote_addr = rt->flat_addr[0][src_dev_id][echo_noc_x][echo_noc_y] + echo_l1_addr;
 
     // Use recv_addr as the source (holds the value we just read).

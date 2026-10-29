@@ -1610,6 +1610,88 @@ size_t ControlPlane::get_num_live_routing_planes(
     return this->router_port_directions_to_num_routing_planes_map_.at(fabric_node_id).at(routing_direction);
 }
 
+bool ControlPlane::is_fabric_over_noc() const {
+    if (this->logical_mesh_chip_id_to_physical_chip_id_mapping_.empty()) {
+        return false;
+    }
+    const auto& first = *this->logical_mesh_chip_id_to_physical_chip_id_mapping_.begin();
+    const uint32_t phys_id = first.second;
+    const auto ip_variant = this->cluster_.get().get_soc_desc(phys_id).get_arch_descriptor().get_ip_variant();
+    return this->cluster_.get().arch() == tt::ARCH::QUASAR && ip_variant == tt::IpVariant::HORIZON;
+}
+
+void ControlPlane::configure_routing_tables_for_fabric_over_noc() {
+    this->fabric_over_noc_routing_tables_.clear();
+
+    for (const auto& [src_node, src_phys] : this->logical_mesh_chip_id_to_physical_chip_id_mapping_) {
+        tt::tt_fabric::fabric_over_noc_routing_l1_info_t info = {};
+        info.my_mesh_id = *src_node.mesh_id;
+        info.my_device_id = src_node.chip_id;
+        {
+            const auto my_cores =
+                this->cluster_.get().get_soc_desc(src_phys).get_cores(CoreType::TENSIX, CoordSystem::NOC0);
+            if (!my_cores.empty()) {
+                info.my_noc_x = my_cores[0].x;
+                info.my_noc_y = my_cores[0].y;
+            }
+        }
+
+        for (const auto& [dst_node, dst_phys] : this->logical_mesh_chip_id_to_physical_chip_id_mapping_) {
+            if (*dst_node.mesh_id != *src_node.mesh_id || dst_node.chip_id == src_node.chip_id) {
+                continue;
+            }
+            const uint32_t dst_chip = dst_node.chip_id;
+            if (dst_chip >= tt::tt_fabric::MAX_HORIZON_DEVS_PER_MESH) {
+                log_warning(
+                    tt::LogFabric,
+                    "Horizon routing table: dst chip {} >= MAX_HORIZON_DEVS_PER_MESH ({}), skipping",
+                    dst_chip,
+                    tt::tt_fabric::MAX_HORIZON_DEVS_PER_MESH);
+                continue;
+            }
+
+            auto* dst_device = this->cluster_.get().get_driver()->get_tt_device(dst_phys);
+            if (!dst_device) {
+                continue;
+            }
+            const auto access_points = dst_device->get_access_points();
+            if (access_points.empty()) {
+                continue;
+            }
+            // access_points[0] from chip1 has a 0x10 prefix = chip1's own REMOTE window;
+            // writes to it loop back to chip1 instead of crossing the crossbar to chip0.
+            // Use access_points[1] for the chip1->chip0 direction.
+            // TODO: generalize by querying the ATT for the correct window once UMD exposes that.
+            const size_t ap_idx = (src_node.chip_id == 1 && dst_node.chip_id == 0) ? 1u : 0u;
+            const size_t safe_ap = std::min(ap_idx, access_points.size() - 1);
+
+            for (const auto& core :
+                 this->cluster_.get().get_soc_desc(dst_phys).get_cores(CoreType::TENSIX, CoordSystem::NOC0)) {
+                if (core.x >= tt::tt_fabric::MAX_HORIZON_NOC_X || core.y >= tt::tt_fabric::MAX_HORIZON_NOC_Y) {
+                    continue;
+                }
+                const auto flat = dst_device->get_flat_address(
+                    access_points[safe_ap],
+                    core,
+                    tt::umd::WindowFlags::UnicastWrite,
+                    tt::umd::IoOrdering::Posted,
+                    /*offset=*/0);
+                if (flat.has_value()) {
+                    info.flat_addr[0][dst_chip][core.x][core.y] = *flat;
+                }
+            }
+        }
+
+        this->fabric_over_noc_routing_tables_[src_phys] = info;
+        log_info(
+            tt::LogFabric,
+            "Horizon routing table built for chip {} (my_mesh={} my_device={})",
+            src_phys,
+            info.my_mesh_id,
+            info.my_device_id);
+    }
+}
+
 // Only builds the routing table representation, does not actually populate the routing tables in memory of the
 // fabric routers on device
 void ControlPlane::configure_routing_tables_for_fabric_ethernet_channels() {
@@ -2768,78 +2850,6 @@ void ControlPlane::write_routing_info_to_devices(
         physical_chip_id,
         tt::tt_metal::HalProgrammableCoreType::ACTIVE_ETH);
     this->cluster_.get().l1_barrier(physical_chip_id);
-
-    // Horizon-specific routing table: overrides the standard table at the same L1 address.
-    // Uses get_flat_address() to populate flat_addr[dst_device][noc_x][noc_y] for every
-    // reachable core on every destination device.
-    //
-    // TODO: access_points[0] is used for all destinations; verify with ATT mask coverage.
-    // TODO: offset=0 returns the L1-window base (first 1 MB per core); revisit if writes
-    //       beyond 1 MB into a core's L1 are needed.
-    {
-        const auto ip_variant =
-            this->cluster_.get().get_soc_desc(physical_chip_id).get_arch_descriptor().get_ip_variant();
-        if (ip_variant == tt::IpVariant::HORIZON) {
-            tt::tt_fabric::horizon_routing_l1_info_t horizon_info = {};
-            horizon_info.my_mesh_id = *mesh_id;
-            horizon_info.my_device_id = chip_id;
-            {
-                const auto my_cores =
-                    this->cluster_.get().get_soc_desc(physical_chip_id).get_cores(CoreType::TENSIX, CoordSystem::NOC0);
-                if (!my_cores.empty()) {
-                    horizon_info.my_noc_x = my_cores[0].x;
-                    horizon_info.my_noc_y = my_cores[0].y;
-                }
-            }
-            for (const auto& [dst_node, dst_phys_id] : this->logical_mesh_chip_id_to_physical_chip_id_mapping_) {
-                if (*dst_node.mesh_id != *mesh_id) {
-                    continue;
-                }
-                const uint32_t dst_chip = dst_node.chip_id;
-                if (dst_chip >= tt::tt_fabric::MAX_HORIZON_DEVS_PER_MESH) {
-                    log_warning(
-                        tt::LogFabric,
-                        "Horizon routing table: dst chip {} >= MAX_HORIZON_DEVS_PER_MESH ({}), skipping",
-                        dst_chip,
-                        tt::tt_fabric::MAX_HORIZON_DEVS_PER_MESH);
-                    continue;
-                }
-
-                auto* dst_device = this->cluster_.get().get_driver()->get_tt_device(dst_phys_id);
-                const auto access_points = dst_device->get_access_points();
-                if (access_points.empty()) {
-                    continue;
-                }
-
-                for (const auto& core :
-                     this->cluster_.get().get_soc_desc(dst_phys_id).get_cores(CoreType::TENSIX, CoordSystem::NOC0)) {
-                    if (core.x >= tt::tt_fabric::MAX_HORIZON_NOC_X || core.y >= tt::tt_fabric::MAX_HORIZON_NOC_Y) {
-                        continue;
-                    }
-                    const auto flat = dst_device->get_flat_address(
-                        access_points[0],
-                        core,
-                        tt::umd::WindowFlags::UnicastWrite,
-                        tt::umd::IoOrdering::Posted,
-                        /*offset=*/0);
-                    if (flat.has_value()) {
-                        horizon_info.flat_addr[0][dst_chip][core.x][core.y] = *flat;
-                    }
-                }
-            }
-
-            write_to_all_cores(
-                *this,
-                this->cluster_,
-                this->hal_,
-                &horizon_info,
-                sizeof(horizon_info),
-                tt::tt_metal::HalL1MemAddrType::ROUTING_TABLE,
-                physical_chip_id,
-                tt::tt_metal::HalProgrammableCoreType::TENSIX);
-            this->cluster_.get().l1_barrier(physical_chip_id);
-        }
-    }
 }
 
 // Write connection info to Tensix cores' L1 on a specific chip
@@ -3023,6 +3033,24 @@ void ControlPlane::write_fabric_telemetry_to_all_chips(const FabricNodeId& fabri
 }
 
 void ControlPlane::write_routing_tables_to_all_chips() const {
+    if (this->is_fabric_over_noc()) {
+        // Horizon: write pre-built flat-address routing tables (populated during discovery phase).
+        for (const auto& [phys_chip_id, info] : this->fabric_over_noc_routing_tables_) {
+            write_to_all_cores(
+                *this,
+                this->cluster_,
+                this->hal_,
+                &info,
+                sizeof(info),
+                tt::tt_metal::HalL1MemAddrType::ROUTING_TABLE,
+                phys_chip_id,
+                tt::tt_metal::HalProgrammableCoreType::TENSIX);
+            this->cluster_.get().l1_barrier(phys_chip_id);
+        }
+        return;
+    }
+
+    // WH/BH/Quasar: Ethernet-based direction routing tables.
     // Configure the routing tables on the chips
     TT_ASSERT(
         this->intra_mesh_routing_tables_.size() == this->inter_mesh_routing_tables_.size(),
