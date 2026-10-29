@@ -1637,10 +1637,12 @@ void ControlPlane::configure_routing_tables_for_fabric_over_noc() {
         }
 
         for (const auto& [dst_node, dst_phys] : this->logical_mesh_chip_id_to_physical_chip_id_mapping_) {
-            if (*dst_node.mesh_id != *src_node.mesh_id || dst_node.chip_id == src_node.chip_id) {
-                continue;
+            if (dst_phys == src_phys) {
+                continue;  // skip self; cross-mesh entries are intentional on Horizon (auto-discovery
+                           // places each chip in its own 1x1 mesh when there are no Ethernet links)
             }
-            const uint32_t dst_chip = dst_node.chip_id;
+            // Index by physical chip ID — the kernel receives dst_dev_id as the physical chip ID.
+            const uint32_t dst_chip = dst_phys;
             if (dst_chip >= tt::tt_fabric::MAX_HORIZON_DEVS_PER_MESH) {
                 log_warning(
                     tt::LogFabric,
@@ -1662,7 +1664,7 @@ void ControlPlane::configure_routing_tables_for_fabric_over_noc() {
             // writes to it loop back to chip1 instead of crossing the crossbar to chip0.
             // Use access_points[1] for the chip1->chip0 direction.
             // TODO: generalize by querying the ATT for the correct window once UMD exposes that.
-            const size_t ap_idx = (src_node.chip_id == 1 && dst_node.chip_id == 0) ? 1u : 0u;
+            const size_t ap_idx = (src_phys == 1u && dst_phys == 0u) ? 1u : 0u;
             const size_t safe_ap = std::min(ap_idx, access_points.size() - 1);
 
             for (const auto& core :
@@ -1677,6 +1679,8 @@ void ControlPlane::configure_routing_tables_for_fabric_over_noc() {
                     tt::umd::IoOrdering::Posted,
                     /*offset=*/0);
                 if (flat.has_value()) {
+                    // TODO: assumes single mesh — kernel uses dst_mesh_id=0 unconditionally.
+                    // Generalize when multi-mesh Horizon topologies are supported.
                     info.flat_addr[0][dst_chip][core.x][core.y] = *flat;
                 }
             }
