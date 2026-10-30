@@ -353,6 +353,12 @@ void FabricFirmwareInitializer::configure() {
         initialized_.test_and_set();
         return;
     }
+
+    if (control_plane_.is_fabric_over_noc()) {
+        // Horizon fabric runs over NOC — no ERISC routers to sync.
+        initialized_.test_and_set();
+        return;
+    }
     if (has_flag(descriptor_->fabric_manager(), tt_fabric::FabricManagerMode::INIT_FABRIC)) {
         wait_for_fabric_router_sync(get_fabric_router_sync_timeout_ms());
     }
@@ -376,6 +382,14 @@ void FabricFirmwareInitializer::teardown(std::unordered_set<InitializerKey>& ini
     }
 
     if (devices_.empty()) {
+        devices_.clear();
+        initialized_.clear();
+        init_done.erase(key);
+        return;
+    }
+
+    if (control_plane_.is_fabric_over_noc()) {
+        // Horizon fabric runs over NOC — no ERISC routers to terminate.
         devices_.clear();
         initialized_.clear();
         init_done.erase(key);

@@ -15,7 +15,7 @@
 
 #include "api/dataflow/dataflow_api.h"
 #include "experimental/kernel_args.h"
-#include "tt_metal/fabric/hw/inc/mesh/tt-2xx/quasar_horizon/api_impl.h"
+#include "tt_metal/fabric/hw/inc/mesh/api.h"
 #include "tt_metal/fabric/hw/inc/edm_fabric/edm_fabric_worker_adapters.hpp"
 #include "hostdev/fabric_edm_packet_header.hpp"
 
