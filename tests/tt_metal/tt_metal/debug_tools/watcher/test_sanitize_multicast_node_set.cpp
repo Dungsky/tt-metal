@@ -53,14 +53,15 @@ TensorSpec MakeTileShardedSpec(const CoreRangeSet& nodes) {
 // `target` is one tile on each of logical nodes (0,0) and (1,0). The sender multicasts its one-tile `source` over the
 // rectangle from logical node (start_x,0) to (end_x,0) on `noc`, which runs from start to end: NoC 0 rightward, NoC 1
 // leftward. Corners against the NoC's direction wrap around the grid edge. A sender inside the rectangle is skipped by
-// the multicast.
+// the multicast unless `includes_sender` makes it a loopback multicast.
 void RunMulticastNodeSetTest(
     distributed::MeshDevice& mesh_device,
     CoreCoord sender,
     uint32_t start_x,
     uint32_t end_x,
     NOC noc,
-    bool expect_error) {
+    bool expect_error,
+    bool includes_sender = false) {
     if (MetalContext::instance().rtoptions().watcher_noc_sanitize_disabled()) {
         GTEST_SKIP();
     }
@@ -110,6 +111,7 @@ void RunMulticastNodeSetTest(
                         // The two target nodes. The error cases stop in the check before the multicast is issued.
                         {"num_targets", 2u},
                         {"size_bytes", static_cast<uint32_t>(source_spec.compute_page_size_bytes())},
+                        {"includes_sender", static_cast<uint32_t>(includes_sender)},
                     },
                 .hw_config =
                     experimental::DataMovementHardwareConfig{
@@ -185,4 +187,16 @@ TEST_F(MeshWatcherFixture, TensixTestWatcherSanitizeMulticastSenderInsideRectang
     // The sender on (2,0) holds no tile of `target`, but the multicast skips it.
     RunMulticastNodeSetTest(
         *this->devices_[0], /*sender=*/{2, 0}, /*start_x=*/0, /*end_x=*/2, NOC::NOC_0, /*expect_error=*/false);
+}
+
+TEST_F(MeshWatcherFixture, TensixTestWatcherSanitizeMulticastLoopbackSenderInsideRectangle) {
+    // As above, but the loopback multicast also writes the sender, which holds no tile of `target`.
+    RunMulticastNodeSetTest(
+        *this->devices_[0],
+        /*sender=*/{2, 0},
+        /*start_x=*/0,
+        /*end_x=*/2,
+        NOC::NOC_0,
+        /*expect_error=*/true,
+        /*includes_sender=*/true);
 }
